@@ -299,13 +299,14 @@ export class CommandParser {
       return { success: false, output: 'Game renderer not available' };
     });
 
-    // /weather <clear|rain|thunder> - Set weather
+    // /weather <clear|rain|snow|thunder|storm> - Set weather
     this.registerCommand('weather', async (args, context) => {
-      if (args.length < 1) return { success: false, output: 'Usage: /weather <clear|rain|thunder>' };
-      const weather = args[0].toLowerCase();
-      if (!['clear', 'rain', 'thunder'].includes(weather)) {
+      if (args.length < 1) return { success: false, output: 'Usage: /weather <clear|rain|snow|thunder|storm>' };
+      const input = args[0].toLowerCase();
+      if (!['clear', 'rain', 'snow', 'thunder', 'storm'].includes(input)) {
         return { success: false, output: 'Invalid weather type' };
       }
+      const weather = input === 'thunder' ? 'storm' : input;
       if (context.gameRenderer) {
         context.gameRenderer.setWeather(weather);
         return { success: true, output: `Weather set to ${weather}` };
@@ -313,16 +314,17 @@ export class CommandParser {
       return { success: false, output: 'Game renderer not available' };
     });
 
-    // /gamemode <survival|creative> - Change game mode
+    // /gamemode <survival|grounded|creative> - Change game mode
     this.registerCommand('gamemode', async (args, context) => {
-      if (args.length < 1) return { success: false, output: 'Usage: /gamemode <survival|creative>' };
-      const mode = args[0].toLowerCase();
-      if (!['survival', 'creative'].includes(mode)) {
+      if (args.length < 1) return { success: false, output: 'Usage: /gamemode <survival|grounded|creative>' };
+      const inputMode = args[0].toLowerCase();
+      if (!['survival', 'grounded', 'creative'].includes(inputMode)) {
         return { success: false, output: 'Invalid game mode' };
       }
+      const mode = inputMode === 'grounded' ? 'survival' : inputMode;
       if (context.gameRenderer) {
         context.gameRenderer.setGameMode(mode);
-        return { success: true, output: `Game mode set to ${mode}` };
+        return { success: true, output: `Game mode set to ${inputMode}` };
       }
       return { success: false, output: 'Game renderer not available' };
     });

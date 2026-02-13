@@ -4,6 +4,7 @@ export interface GameSettings {
   fov: number;
   clouds: boolean;
   showHand: boolean;
+  showTouchControls: boolean;
   shadows: boolean;
   particles: boolean;
   fancyGraphics: boolean;
@@ -33,6 +34,7 @@ export const DEFAULT_SETTINGS: GameSettings = {
   fov: 75,
   clouds: true,
   showHand: true,
+  showTouchControls: true,
   shadows: true,
   particles: true,
   fancyGraphics: true,

@@ -159,6 +159,7 @@ export async function handler(event) {
         animals: room.animals || [],
         latestSeq: room.lastSeq,
         world: room.world,
+        environment: room.environment || { timeOfDay: 0.3, weather: 'clear' },
       });
     }
 
@@ -178,6 +179,10 @@ export async function handler(event) {
         world: {
           seed: Number.isFinite(world.seed) ? Math.floor(world.seed) : 12345,
           worldType: world.worldType === 'flat' ? 'flat' : 'normal',
+        },
+        environment: {
+          timeOfDay: 0.3,
+          weather: 'clear',
         },
         players: {},
         events: [],
@@ -263,6 +268,14 @@ export async function handler(event) {
           y: Number(a.y || 0),
           z: Number(a.z || 0),
         }));
+      }
+
+      if (playerId === room.hostId && body.environment && typeof body.environment === 'object') {
+        const weatherRaw = String(body.environment.weather || 'clear');
+        const weather = weatherRaw === 'rain' || weatherRaw === 'snow' || weatherRaw === 'storm' ? weatherRaw : 'clear';
+        const t = Number(body.environment.timeOfDay);
+        const timeOfDay = Number.isFinite(t) ? ((t % 1) + 1) % 1 : 0.3;
+        room.environment = { timeOfDay, weather };
       }
 
       room.updatedAt = Date.now();

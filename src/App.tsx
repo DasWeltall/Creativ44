@@ -8,7 +8,7 @@ import { settingsManager, GameSettings } from './game/settings';
 import { textureManager, FaceDir } from './game/textureManager';
 import { worldManager } from './game/worldManager';
 import { modManager, RuntimeMod } from './game/modManager';
-import { multiplayerClient, MultiplayerSession } from './game/multiplayerClient';
+import { multiplayerClient, MultiplayerEnvironmentState, MultiplayerSession } from './game/multiplayerClient';
 
 type GameState = 'menu' | 'worldselect' | 'multiplayermenu' | 'loading' | 'playing';
 type HotbarItem = { type: 'block'; block: BlockType } | { type: 'tool'; tool: ToolType };
@@ -493,11 +493,11 @@ function HamburgerMenu({ renderer, gameMode, onModeChange, onOpenSettings }: { r
                   <MCBtn onClick={() => { renderer.toggleGameMode(); onModeChange(renderer.getGameMode()); setOpen(false); }}
                     color={gameMode === 'survival' ? 'green' : 'gray'}
                     style={{ width: 'min(100%, 340px)', borderRadius: 0 }}>
-                    {gameMode === 'creative' ? '⚔ Switch to Survival' : '✦ Switch to Creative'}
+                    {gameMode === 'creative' ? '⛰ Switch to Grounded' : '✦ Switch to Creative'}
                   </MCBtn>
                 </div>
                 <div className="text-center text-sm text-gray-400 -mt-1 font-bold" style={{ fontFamily: MC, textShadow: '1px 1px 0 #000' }}>
-                  {gameMode === 'creative' ? 'Fly freely, unlimited blocks' : 'Gravity, health, fall damage'}
+                  {gameMode === 'creative' ? 'Fly freely, unlimited blocks' : 'No flying, collisions active, grounded physics'}
                 </div>
                 <div className="w-full flex justify-center">
                   <MCBtn onClick={() => { setOpen(false); onOpenSettings(); }} color="gray" style={{ width: 'min(100%, 340px)', borderRadius: 0 }}>
@@ -746,6 +746,8 @@ function GameUI({
   const [gameMode, setGameMode] = useState<GameMode>('creative');
   const [fps, setFps] = useState(0);
   const [mpOpen, setMpOpen] = useState(false);
+  const [quickToolsOpen, setQuickToolsOpen] = useState(false);
+  const [quickToolsStatus, setQuickToolsStatus] = useState('');
   const [mpName, setMpName] = useState(() => initialMultiplayerName || localStorage.getItem('creativ44_mp_name') || 'Player');
   const [mpJoinCode, setMpJoinCode] = useState('');
   const [mpSession, setMpSession] = useState<MultiplayerSession | null>(initialMultiplayerSession || null);
@@ -768,11 +770,15 @@ function GameUI({
   const joystickKnobPx = Math.round(80 * joystickScale);
   const joystickSidePx = Math.max(0, Math.round(32 + (uiSettings.joystickSideOffset || 0)));
   const joystickBottomPx = Math.max(0, Math.round(80 + (uiSettings.joystickBottomOffset || 0)));
-  const hotbarItemSize = Math.round(64 * hotbarScale);
-  const hotbarPadX = Math.round(20 * hotbarScale);
-  const hotbarPadY = Math.round(16 * hotbarScale);
+  const hotbarItemSize = Math.round(46 * hotbarScale);
+  const hotbarPadX = Math.round(12 * hotbarScale);
+  const hotbarPadY = Math.round(6 * hotbarScale);
   const hotbarBottom = Math.max(0, Math.round(8 + (uiSettings.hotbarBottomOffset || 0)));
   const hotbarSideOffset = Math.round(uiSettings.hotbarSideOffset || 0);
+  const hotbarAccent = 'rgba(58,229,255,0.95)';
+  const lookSensitivity = 0.0018 + (Math.max(1, Math.min(200, uiSettings.mouseSensitivity || 50)) / 100) * 0.0032;
+  const touchLookSensitivity = lookSensitivity * 2.1;
+  const lookPitchSign = uiSettings.invertMouse ? 1 : -1;
 
   useEffect(() => {
     renderer.setModeCallback(setGameMode);
@@ -813,20 +819,29 @@ function GameUI({
   useEffect(() => {
     if (!mpSession) {
       renderer.updateRemotePlayers([], '');
+      renderer.setExternalEnvironmentControl(false);
       return;
     }
+    renderer.setExternalEnvironmentControl(!mpSession.isHost);
     let cancelled = false;
     const loop = async () => {
       if (cancelled) return;
       try {
         const player = renderer.getMultiplayerPlayerState(mpSession.playerId, mpName || 'Player', profile.skin);
         const events = mpPendingEvents.current.splice(0, mpPendingEvents.current.length);
+        const environment: MultiplayerEnvironmentState | undefined = mpSession.isHost
+          ? {
+              timeOfDay: renderer.getTimeOfDayNormalized(),
+              weather: renderer.getWeatherType(),
+            }
+          : undefined;
         await multiplayerClient.pushState({
           roomCode: mpSession.roomCode,
           playerId: mpSession.playerId,
           player,
           events,
           animals: mpSession.isHost ? renderer.getMultiplayerAnimals() : undefined,
+          environment,
         });
         const data = await multiplayerClient.pullState(mpSession.roomCode, mpSession.playerId, mpLastSeq.current);
         mpLastSeq.current = data.latestSeq;
@@ -836,6 +851,14 @@ function GameUI({
           for (const ev of foreignEvents) worldManager.setBlockEdit(worldId, ev.x, ev.y, ev.z, ev.type);
         }
         if (!mpSession.isHost) renderer.applyMultiplayerAnimals(data.animals);
+        if (!mpSession.isHost && data.environment) {
+          const nextTime = ((data.environment.timeOfDay % 1) + 1) % 1;
+          const currTime = renderer.getTimeOfDayNormalized();
+          const directDiff = Math.abs(nextTime - currTime);
+          const wrapDiff = Math.min(directDiff, 1 - directDiff);
+          if (wrapDiff > 0.002) renderer.setTimeOfDayNormalized(nextTime);
+          if (renderer.getWeatherType() !== data.environment.weather) renderer.setWeather(data.environment.weather);
+        }
         renderer.updateRemotePlayers(data.players as MultiplayerPlayerState[], mpSession.playerId);
         setMpPeers(data.players.length);
         setMpStatus(`Connected (${data.players.length} players)`);
@@ -924,10 +947,10 @@ function GameUI({
         const dx = t.clientX - lastLook.current.x, dy = t.clientY - lastLook.current.y;
         lastLook.current = { x: t.clientX, y: t.clientY };
         const rot = renderer.getRotation();
-        renderer.setRotation(rot.yaw - dx * 0.004, rot.pitch - dy * 0.004);
+        renderer.setRotation(rot.yaw - dx * touchLookSensitivity, rot.pitch + dy * touchLookSensitivity * lookPitchSign);
       }
     }
-  }, [renderer]);
+  }, [renderer, touchLookSensitivity, lookPitchSign]);
   const lEnd = useCallback((e: React.TouchEvent) => {
     for (let i = 0; i < e.changedTouches.length; i++) {
       if (e.changedTouches[i].identifier === lTouchId.current) lTouchId.current = null;
@@ -939,8 +962,8 @@ function GameUI({
     const keys = new Set<string>();
     const upd = () => {
       let mx = 0, mz = 0;
-      if (keys.has('w') || keys.has('arrowup')) mz = 1;
-      if (keys.has('s') || keys.has('arrowdown')) mz = -1;
+      if (keys.has('w') || keys.has('arrowup')) mz = -1;
+      if (keys.has('s') || keys.has('arrowdown')) mz = 1;
       if (keys.has('a') || keys.has('arrowleft')) mx = -1;
       if (keys.has('d') || keys.has('arrowright')) mx = 1;
       renderer.setMoveInput(mx, mz);
@@ -975,7 +998,7 @@ function GameUI({
     const mm = (e: MouseEvent) => {
       if (document.pointerLockElement && !inventoryOpen) {
         const rot = renderer.getRotation();
-        renderer.setRotation(rot.yaw - e.movementX * 0.002, rot.pitch - e.movementY * 0.002);
+        renderer.setRotation(rot.yaw - e.movementX * lookSensitivity, rot.pitch + e.movementY * lookSensitivity * lookPitchSign);
       }
     };
     const cl = () => { 
@@ -1060,7 +1083,7 @@ function GameUI({
       stopBreaking();
       stopPlacing();
     };
-  }, [renderer, inventoryOpen]);
+  }, [renderer, inventoryOpen, lookSensitivity, lookPitchSign]);
 
   const selectSlot = (i: number) => { setSelectedSlot(i); renderer.setSelectedSlot(i); };
   const setHotbarItem = useCallback((slot: number, item: HotbarItem) => {
@@ -1112,12 +1135,53 @@ function GameUI({
     renderer.updateRemotePlayers([], '');
   };
 
+  const quickSelectedBlock = hotbarItems[selectedSlot]?.type === 'block'
+    ? hotbarItems[selectedSlot].block
+    : BlockType.STONE;
+  const setQuickStatus = (msg: string) => {
+    setQuickToolsStatus(msg);
+    window.setTimeout(() => setQuickToolsStatus((prev) => (prev === msg ? '' : prev)), 2200);
+  };
+  const quickFillArea = () => {
+    const p = renderer.getPlayerPos();
+    const x = Math.floor(p.x);
+    const y = Math.max(1, Math.floor(p.y - 1));
+    const z = Math.floor(p.z);
+    renderer.fillRegion(x - 3, y, z - 3, x + 3, y, z + 3, quickSelectedBlock);
+    setQuickStatus(`Fill: ${BLOCK_NAMES[quickSelectedBlock]}`);
+  };
+  const quickCloneArea = () => {
+    const p = renderer.getPlayerPos();
+    const x = Math.floor(p.x);
+    const y = Math.max(1, Math.floor(p.y - 1));
+    const z = Math.floor(p.z);
+    renderer.cloneRegion(x - 2, y, z - 2, x + 2, y + 3, z + 2, x + 8, y, z);
+    setQuickStatus('Clone: moved +8 on X');
+  };
+  const quickWeather = (weather: 'clear' | 'rain' | 'snow' | 'storm') => {
+    renderer.setWeather(weather);
+    setQuickStatus(`Weather: ${weather}`);
+  };
+  const quickTime = (label: 'day' | 'night') => {
+    renderer.setWorldTime(label === 'day' ? 1000 : 13000);
+    setQuickStatus(`Time: ${label}`);
+  };
+  const quickRunCommand = async () => {
+    const input = window.prompt('Quick command', '/time set day');
+    if (!input || !input.trim()) return;
+    const cmd = input.trim().replace(/^\//, '');
+    const result = await renderer.executeCommand(cmd);
+    setQuickStatus(result.success ? result.output : `Error: ${result.output}`);
+  };
+
   return (
     <>
       {/* Look area */}
-      <div className="fixed top-0 right-0 w-[60%] h-full z-10"
-        onTouchStart={lStart} onTouchMove={lMove} onTouchEnd={lEnd}
-        style={{ touchAction: 'none' }} />
+      {uiSettings.showTouchControls && (
+        <div className="fixed top-0 right-0 w-[60%] h-full z-10"
+          onTouchStart={lStart} onTouchMove={lMove} onTouchEnd={lEnd}
+          style={{ touchAction: 'none' }} />
+      )}
 
       {/* Crosshair */}
       <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none">
@@ -1142,11 +1206,55 @@ function GameUI({
 
       <div className="fixed top-2 right-16 z-40">
         <button
-          className="px-5 py-3 rounded-xl text-white text-sm font-bold"
-          style={{ fontFamily: MC, background: 'rgba(0,0,0,0.55)', border: '2px solid rgba(120,210,255,0.65)' }}
+          className="w-12 h-12 rounded-2xl text-white text-xl font-bold active:scale-95"
+          style={{
+            fontFamily: MC,
+            background: quickToolsOpen ? 'rgba(31,56,39,0.92)' : 'rgba(0,0,0,0.6)',
+            border: quickToolsOpen ? '2px solid rgba(126,217,87,0.95)' : '2px solid rgba(255,255,255,0.35)',
+            boxShadow: '0 6px 16px rgba(0,0,0,0.35)',
+            lineHeight: 1,
+          }}
+          onClick={() => setQuickToolsOpen((v) => !v)}
+          title="Quick Tools"
+        >
+          ^
+        </button>
+      </div>
+      {quickToolsOpen && (
+        <div className="fixed top-16 right-16 z-50 w-64 p-3 rounded-xl space-y-2"
+          style={{ background: 'rgba(13,22,33,0.95)', border: '2px solid rgba(120,210,255,0.75)', fontFamily: MC }}>
+          <div className="text-white text-sm font-bold">Quick Tools</div>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={quickFillArea} className="py-2 rounded bg-emerald-600 text-white text-xs font-bold">Fill</button>
+            <button onClick={quickCloneArea} className="py-2 rounded bg-indigo-600 text-white text-xs font-bold">Clone</button>
+            <button onClick={() => quickWeather('clear')} className="py-2 rounded bg-slate-600 text-white text-xs font-bold">Clear</button>
+            <button onClick={() => quickWeather('rain')} className="py-2 rounded bg-blue-600 text-white text-xs font-bold">Rain</button>
+            <button onClick={() => quickWeather('snow')} className="py-2 rounded bg-cyan-600 text-white text-xs font-bold">Snow</button>
+            <button onClick={() => quickWeather('storm')} className="py-2 rounded bg-violet-600 text-white text-xs font-bold">Storm</button>
+            <button onClick={() => quickTime('day')} className="py-2 rounded bg-yellow-600 text-white text-xs font-bold">Day</button>
+            <button onClick={() => quickTime('night')} className="py-2 rounded bg-gray-700 text-white text-xs font-bold">Night</button>
+          </div>
+          <button onClick={quickRunCommand} className="w-full py-2 rounded bg-orange-600 text-white text-xs font-bold">Run Command...</button>
+          <div className="text-[10px] text-cyan-200 min-h-[14px] break-words">{quickToolsStatus}</div>
+        </div>
+      )}
+
+      <div className="fixed top-16 right-2 z-40">
+        <button
+          className="px-5 py-3 rounded-2xl text-white text-sm font-bold min-w-[150px] active:scale-95"
+          style={{
+            fontFamily: MC,
+            background: mpSession ? 'rgba(18,49,40,0.85)' : 'rgba(0,0,0,0.6)',
+            border: mpSession ? '2px solid rgba(93,240,180,0.95)' : '2px solid rgba(120,210,255,0.75)',
+            boxShadow: '0 6px 16px rgba(0,0,0,0.35)',
+            textAlign: 'center',
+          }}
           onClick={() => setMpOpen(v => !v)}
         >
-          MP
+          <div style={{ lineHeight: 1.05 }}>
+            <div style={{ fontSize: 16, letterSpacing: '0.02em' }}>MULTIPLAYER</div>
+            <div style={{ fontSize: 10, opacity: 0.9 }}>{mpSession ? `ONLINE (${mpPeers})` : 'OFFLINE'}</div>
+          </div>
         </button>
       </div>
       {mpOpen && (
@@ -1181,93 +1289,99 @@ function GameUI({
       )}
 
       {/* Joystick */}
-      <div ref={joystickRef} className="fixed z-30 rounded-full"
-        style={{
-          width: joystickSizePx,
-          height: joystickSizePx,
-          left: joystickSidePx,
-          bottom: joystickBottomPx,
-          background: 'radial-gradient(circle at 30% 30%, rgba(188,208,165,0.32), rgba(50,72,39,0.6))',
-          border: '2px solid rgba(34,48,27,0.9)',
-          boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.15), 0 6px 20px rgba(0,0,0,0.4)',
-          touchAction: 'none',
-        }}
-        onTouchStart={jStart} onTouchMove={jMove} onTouchEnd={jEnd}>
-        <div className="absolute inset-0 flex items-center justify-center">
-          <div ref={knobRef} className="rounded-full"
-            style={{
-              width: joystickKnobPx,
-              height: joystickKnobPx,
-              background: 'radial-gradient(circle at 30% 30%, #d4e3b6, #66844d)',
-              border: '2px solid #2c4422',
-              boxShadow: '0 2px 0 #1f3117',
-            }} />
+      {uiSettings.showTouchControls && (
+        <div ref={joystickRef} className="fixed z-30 rounded-full"
+          style={{
+            width: joystickSizePx,
+            height: joystickSizePx,
+            left: joystickSidePx,
+            bottom: joystickBottomPx,
+            background: 'radial-gradient(circle at 30% 30%, rgba(188,208,165,0.32), rgba(50,72,39,0.6))',
+            border: '2px solid rgba(34,48,27,0.9)',
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.15), 0 6px 20px rgba(0,0,0,0.4)',
+            touchAction: 'none',
+          }}
+          onTouchStart={jStart} onTouchMove={jMove} onTouchEnd={jEnd}>
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div ref={knobRef} className="rounded-full"
+              style={{
+                width: joystickKnobPx,
+                height: joystickKnobPx,
+                background: 'radial-gradient(circle at 30% 30%, #d4e3b6, #66844d)',
+                border: '2px solid #2c4422',
+                boxShadow: '0 2px 0 #1f3117',
+              }} />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Fly/Jump */}
-      <div className="fixed bottom-32 right-5 z-30 flex flex-col gap-2">
-        <button className="w-[52px] h-[52px] rounded-lg flex items-center justify-center text-white text-lg font-bold active:scale-90"
-          style={{
-            fontFamily: MC,
-            background: 'linear-gradient(180deg, #6f8d4f 0%, #4f6b36 100%)',
-            border: '2px solid #24331a',
-            boxShadow: '0 3px 0 #1b2614',
-            textShadow: '1px 1px 0 #000',
-          }}
-          onTouchStart={() => { renderer.setFlyUp(true); renderer.setJump(true); }}
-          onTouchEnd={() => { renderer.setFlyUp(false); renderer.setJump(false); }}>UP</button>
-        <button className="w-[52px] h-[52px] rounded-lg flex items-center justify-center text-white text-lg font-bold active:scale-90"
-          style={{
-            fontFamily: MC,
-            background: 'linear-gradient(180deg, #6f8d4f 0%, #4f6b36 100%)',
-            border: '2px solid #24331a',
-            boxShadow: '0 3px 0 #1b2614',
-            textShadow: '1px 1px 0 #000',
-          }}
-          onTouchStart={() => renderer.setFlyDown(true)}
-          onTouchEnd={() => renderer.setFlyDown(false)}>DN</button>
-      </div>
+      {uiSettings.showTouchControls && (
+        <div className="fixed bottom-32 right-5 z-30 flex flex-col gap-2">
+          <button className="w-[52px] h-[52px] rounded-lg flex items-center justify-center text-white text-lg font-bold active:scale-90"
+            style={{
+              fontFamily: MC,
+              background: 'linear-gradient(180deg, #6f8d4f 0%, #4f6b36 100%)',
+              border: '2px solid #24331a',
+              boxShadow: '0 3px 0 #1b2614',
+              textShadow: '1px 1px 0 #000',
+            }}
+            onTouchStart={() => { renderer.setFlyUp(true); renderer.setJump(true); }}
+            onTouchEnd={() => { renderer.setFlyUp(false); renderer.setJump(false); }}>UP</button>
+          <button className="w-[52px] h-[52px] rounded-lg flex items-center justify-center text-white text-lg font-bold active:scale-90"
+            style={{
+              fontFamily: MC,
+              background: 'linear-gradient(180deg, #6f8d4f 0%, #4f6b36 100%)',
+              border: '2px solid #24331a',
+              boxShadow: '0 3px 0 #1b2614',
+              textShadow: '1px 1px 0 #000',
+            }}
+            onTouchStart={() => renderer.setFlyDown(true)}
+            onTouchEnd={() => renderer.setFlyDown(false)}>DN</button>
+        </div>
+      )}
 
       {/* Action buttons */}
-      <div className="fixed bottom-6 right-5 z-30 flex gap-1.5">
-        <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
-          style={{
-            fontFamily: MC,
-            background: 'linear-gradient(180deg, #aa5e42 0%, #7f3f28 100%)',
-            border: '2px solid #3f2014',
-            boxShadow: '0 3px 0 #2b160d',
-            color: '#fff',
-            textShadow: '1px 1px 0 #000',
-          }}
-          onTouchStart={() => renderer.breakBlock()}>
-          <span className="text-[11px]">BRK</span>
-        </button>
-        <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
-          style={{
-            fontFamily: MC,
-            background: 'linear-gradient(180deg, #5e88aa 0%, #355975 100%)',
-            border: '2px solid #1a2f40',
-            boxShadow: '0 3px 0 #13212d',
-            color: '#fff',
-            textShadow: '1px 1px 0 #000',
-          }}
-          onTouchStart={() => renderer.placeBlock()}>
-          <span className="text-[11px]">SET</span>
-        </button>
-        <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
-          style={{
-            fontFamily: MC,
-            background: 'linear-gradient(180deg, #ab9656 0%, #7c682f 100%)',
-            border: '2px solid #3f3518',
-            boxShadow: '0 3px 0 #2a2310',
-            color: '#fff',
-            textShadow: '1px 1px 0 #000',
-          }}
-          onTouchStart={() => renderer.interactBlock()}>
-          <span className="text-[11px]">USE</span>
-        </button>
-      </div>
+      {uiSettings.showTouchControls && (
+        <div className="fixed bottom-6 right-5 z-30 flex gap-1.5">
+          <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
+            style={{
+              fontFamily: MC,
+              background: 'linear-gradient(180deg, #aa5e42 0%, #7f3f28 100%)',
+              border: '2px solid #3f2014',
+              boxShadow: '0 3px 0 #2b160d',
+              color: '#fff',
+              textShadow: '1px 1px 0 #000',
+            }}
+            onTouchStart={() => renderer.breakBlock()}>
+            <span className="text-[11px]">BRK</span>
+          </button>
+          <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
+            style={{
+              fontFamily: MC,
+              background: 'linear-gradient(180deg, #5e88aa 0%, #355975 100%)',
+              border: '2px solid #1a2f40',
+              boxShadow: '0 3px 0 #13212d',
+              color: '#fff',
+              textShadow: '1px 1px 0 #000',
+            }}
+            onTouchStart={() => renderer.placeBlock()}>
+            <span className="text-[11px]">SET</span>
+          </button>
+          <button className="w-12 h-12 rounded-lg flex items-center justify-center active:scale-90"
+            style={{
+              fontFamily: MC,
+              background: 'linear-gradient(180deg, #ab9656 0%, #7c682f 100%)',
+              border: '2px solid #3f3518',
+              boxShadow: '0 3px 0 #2a2310',
+              color: '#fff',
+              textShadow: '1px 1px 0 #000',
+            }}
+            onTouchStart={() => renderer.interactBlock()}>
+            <span className="text-[11px]">USE</span>
+          </button>
+        </div>
+      )}
 
       {/* Hotbar with inventory button */}
       <div
@@ -1282,7 +1396,7 @@ function GameUI({
             paddingTop: hotbarPadY,
             paddingBottom: hotbarPadY,
             background: 'linear-gradient(180deg, rgba(10,18,28,0.72) 0%, rgba(8,14,22,0.6) 100%)',
-            border: '3px solid rgba(120,210,255,0.7)',
+            border: `3px solid ${hotbarAccent}`,
             borderRadius: 16,
             backdropFilter: 'blur(4px)',
           }}
@@ -1299,21 +1413,21 @@ function GameUI({
                   borderRadius: 0,
                   background: 'transparent',
                   border: 'none',
-                  borderLeft: i === 0 ? 'none' : '3px solid rgba(120,210,255,0.7)',
+                  borderLeft: i === 0 ? 'none' : `3px solid ${hotbarAccent}`,
                   boxShadow: 'none',
                 }}
                 onClick={() => selectSlot(i)}
               >
-                {item.type === 'tool' ? <ToolIcon tool={item.tool} size={Math.round(38 * hotbarScale)} /> : <BlockIcon block={item.block} size={Math.round(38 * hotbarScale)} />}
+                {item.type === 'tool' ? <ToolIcon tool={item.tool} size={Math.round(31 * hotbarScale)} /> : <BlockIcon block={item.block} size={Math.round(31 * hotbarScale)} />}
                 {isActive && (
                   <div
                     className="absolute"
                     style={{
-                      left: 10,
-                      right: 10,
-                      bottom: -3,
+                      left: 8,
+                      right: 8,
+                      bottom: -(hotbarPadY + 2),
                       height: 4,
-                      borderRadius: 1,
+                      borderRadius: 0,
                       background: '#f4d03f',
                       boxShadow: '0 0 6px rgba(244,208,63,0.6)',
                     }}
@@ -1326,10 +1440,10 @@ function GameUI({
         <button
           className="flex items-center justify-center active:scale-90"
           style={{
-            width: Math.round(50 * hotbarScale),
-            height: Math.round(50 * hotbarScale),
+            width: Math.round(44 * hotbarScale),
+            height: Math.round(44 * hotbarScale),
             background: 'rgba(0,0,0,0.5)',
-            border: '3px solid rgba(120,210,255,0.7)',
+            border: `3px solid ${hotbarAccent}`,
             borderRadius: 16,
             boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.12)',
           }}
@@ -1412,7 +1526,7 @@ function PosDisplay({ renderer, gameMode }: { renderer: GameRenderer; gameMode: 
     <div>
       <div>XYZ: {pos.x} / {pos.y} / {pos.z}</div>
       <div style={{ color: 'rgba(255,255,255,0.3)' }}>
-        {gameMode === 'creative' ? '✦ Creative' : '⚔ Survival'} | {seasonEmojis[season]} {season.charAt(0).toUpperCase() + season.slice(1)}
+        {gameMode === 'creative' ? '✦ Creative' : '⛰ Grounded'} | {seasonEmojis[season]} {season.charAt(0).toUpperCase() + season.slice(1)}
       </div>
     </div>
   );
@@ -1510,7 +1624,7 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
       '- clone(x1,y1,z1,x2,y2,z2,dx,dy,dz)',
       '- explode(x,y,z,power?)',
       '- setTime(value), setWeather("clear"|"rain"|"snow"|"storm")',
-      '- setGameMode("creative"|"survival")',
+      '- setGameMode("creative"|"survival"|"grounded")',
       '- summon(entity,x,y,z)',
       '- execute(commandString)',
       '- registerCommand(name, async (args, ctx) => ({success, output}))',
@@ -1796,7 +1910,7 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
   );
 
   const controlsSettings = (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <h3 className="text-lg font-bold text-white mb-4" style={{ fontFamily: MC }}>Controls</h3>
       
       <div className="bg-[#3a3a3a] p-4 rounded-xl">
@@ -1823,12 +1937,12 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
         </div>
       </div>
 
-      <div className="bg-[#3a3a3a] p-4 rounded-xl">
-        <h4 className="text-white text-sm font-bold mb-3" style={{ fontFamily: MC }}>Mouse Sensitivity</h4>
+      <div className="bg-[#3a3a3a] p-5 rounded-xl">
+        <h4 className="text-white text-sm font-bold mb-3" style={{ fontFamily: MC }}>Look Sensitivity (Mouse + Touch)</h4>
         <input
           type="range"
           min="1"
-          max="100"
+          max="200"
           value={settings.mouseSensitivity}
           onChange={(e) => updateSetting('mouseSensitivity', parseInt(e.target.value))}
           className="w-full h-2 bg-gray-600 rounded-lg appearance-none cursor-pointer"
@@ -1836,8 +1950,18 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
         <p className="text-xs text-gray-400 mt-2" style={{ fontFamily: MC }}>{settings.mouseSensitivity}%</p>
       </div>
 
-      <div className="bg-[#3a3a3a] p-4 rounded-xl">
+      <div className="bg-[#3a3a3a] p-5 rounded-xl">
         <h4 className="text-white text-sm font-bold mb-3" style={{ fontFamily: MC }}>Touch Layout</h4>
+        <div className="mb-4 p-3 rounded-lg bg-[#2f2f2f] flex items-center justify-between">
+          <span className="text-white text-xs" style={{ fontFamily: MC }}>Show Touch Buttons</span>
+          <button
+            onClick={() => updateSetting('showTouchControls', !settings.showTouchControls)}
+            className={`px-3 py-1.5 rounded-md text-xs font-bold ${settings.showTouchControls ? 'bg-green-500 text-white' : 'bg-red-500 text-white'}`}
+            style={{ fontFamily: MC }}
+          >
+            {settings.showTouchControls ? 'ON' : 'OFF'}
+          </button>
+        </div>
         <label className="block text-white text-xs mb-1" style={{ fontFamily: MC }}>
           Joystick Size: {settings.joystickSize.toFixed(2)}x
         </label>
@@ -2220,9 +2344,9 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
           </button>
         </div>
 
-        <div className="flex h-[66vh]">
+        <div className="flex h-[70vh]">
           {/* Sidebar tabs */}
-          <div className="w-52 border-r-2 border-gray-700 flex flex-col gap-1 p-2"
+          <div className="w-56 border-r-2 border-gray-700 flex flex-col gap-2 p-3"
             style={{ background: '#1a1a1a' }}>
             {[
               { id: 'video', label: 'Video', icon: '🎮' },
@@ -2234,7 +2358,7 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id as typeof activeTab)}
-                className={`px-4 py-4 text-left rounded-lg transition-all ${
+                className={`px-4 py-3.5 text-left rounded-lg transition-all ${
                   activeTab === tab.id 
                     ? 'bg-blue-500/20 text-blue-400 border-r-2 border-blue-400' 
                     : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
@@ -2248,7 +2372,7 @@ function SettingsModal({ isOpen, onClose, renderer }: { isOpen: boolean; onClose
           </div>
 
           {/* Content */}
-          <div className="flex-1 p-6 overflow-y-auto" style={{ background: '#222' }}>
+          <div className="flex-1 p-7 overflow-y-auto" style={{ background: '#222' }}>
             {activeTab === 'video' && videoSettings}
             {activeTab === 'audio' && audioSettings}
             {activeTab === 'controls' && controlsSettings}
@@ -2334,7 +2458,7 @@ function WorldSelectScreen({ onSelectWorld, onBack }: { onSelectWorld: (worldId:
               No worlds yet. Create one!
             </p>
           )}
-          <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-5 gap-5">
+          <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-5 gap-7">
             {worlds.map(world => (
               <button
                 key={world.id}

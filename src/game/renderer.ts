@@ -54,6 +54,15 @@ interface BreakParticle {
   restTimer: number;
 }
 
+interface ActiveBreakState {
+  x: number;
+  y: number;
+  z: number;
+  block: BlockType;
+  progress: number;
+  lastHit: number;
+}
+
 interface NPC {
   mesh: THREE.Group;
   name: string;
@@ -140,6 +149,8 @@ export class GameRenderer {
   private fog!: THREE.Fog;
   private sunMesh!: THREE.Mesh;
   private moonMesh!: THREE.Mesh;
+  private sunGlow!: THREE.Sprite;
+  private moonGlow!: THREE.Sprite;
   private starsGroup!: THREE.Group;
   private _gameMode: GameMode = 'creative';
   private _hotbar: BlockType[] = [...HOTBAR_BLOCKS];
@@ -153,6 +164,7 @@ export class GameRenderer {
   private redstoneActive: Map<string, boolean> = new Map();
   private rsPoweredState: Map<string, boolean> = new Map();
   private lastRedstoneUpdate = 0;
+  private redstoneDirty = true;
   private onBlockChanged: ((ev: MultiplayerBlockEvent) => void) | null = null;
   private worldSeed: number;
   private worldType: 'normal' | 'flat';
@@ -162,6 +174,27 @@ export class GameRenderer {
   private lastGroundY = 0;
   private wasFalling = false;
   private noteParticles: { mesh: THREE.Mesh; life: number; vy: number }[] = [];
+  private breakOverlayMesh!: THREE.Mesh;
+  private breakOverlayMaterial!: THREE.MeshBasicMaterial;
+  private breakStageTextures: THREE.Texture[] = [];
+  private activeBreak: ActiveBreakState | null = null;
+  private chunkRefreshTimer = 0;
+  private lastPlayerChunkX = Number.NaN;
+  private lastPlayerChunkZ = Number.NaN;
+  private skyUpdateAccumulator = 0;
+  private animalsUpdateAccumulator = 0;
+  private weatherUpdateAccumulator = 0;
+  private waterFlowAccumulator = 0;
+  private raycastAccumulator = 0;
+  private skyStep = 1 / 40;
+  private animalsStep = 1 / 30;
+  private weatherStep = 1 / 36;
+  private waterFlowStep = 1 / 8;
+  private raycastStep = 1 / 60;
+  private moveVec = new THREE.Vector3();
+  private forwardVec = new THREE.Vector3();
+  private rightVec = new THREE.Vector3();
+  private waterFlowActive = new Set<string>();
 
   // Advanced systems
   private physicsEngine!: PhysicsEngine;
@@ -174,6 +207,8 @@ export class GameRenderer {
   private lightningLight!: THREE.PointLight;
   private nextLightningTime = 0;
   private weatherTimer = 0;
+  private externalEnvironmentControl = false;
+  private readonly dayCycleSpeed = 1 / 720;
   
   // Season system
   private currentSeason: 'spring' | 'summer' | 'autumn' | 'winter' = 'summer';
@@ -189,7 +224,8 @@ export class GameRenderer {
   
   // Device detection
   private readonly lowEndDevice: boolean;
-  private readonly renderDistance: number;
+  private readonly maxRenderDistance: number;
+  private renderDistance: number;
 
   private detectLowEndDevice(): boolean {
     const nav = navigator as Navigator & { deviceMemory?: number };
@@ -204,6 +240,11 @@ export class GameRenderer {
     this.worldSeed = Number.isFinite(worldOptions?.seed) ? Math.floor(worldOptions!.seed as number) : 12345;
     this.worldType = worldOptions?.worldType === 'flat' ? 'flat' : 'normal';
     this.lowEndDevice = this.detectLowEndDevice();
+    this.skyStep = this.lowEndDevice ? 1 / 28 : 1 / 40;
+    this.animalsStep = this.lowEndDevice ? 1 / 20 : 1 / 30;
+    this.weatherStep = this.lowEndDevice ? 1 / 24 : 1 / 36;
+    this.waterFlowStep = this.lowEndDevice ? 1 / 5 : 1 / 8;
+    this.raycastStep = this.lowEndDevice ? 1 / 42 : 1 / 60;
     configureWorldGeneration({
       seed: this.worldSeed,
       worldType: this.worldType,
@@ -211,8 +252,8 @@ export class GameRenderer {
     
     // Load settings
     const settings = settingsManager.getSettings();
-    const maxRenderDistance = this.lowEndDevice ? 5 : 16;
-    this.renderDistance = Math.max(3, Math.min(maxRenderDistance, settings.renderDistance));
+    this.maxRenderDistance = 16;
+    this.renderDistance = Math.max(3, Math.min(this.maxRenderDistance, settings.renderDistance));
 
     this.scene = new THREE.Scene();
     
@@ -237,12 +278,12 @@ export class GameRenderer {
     
     // Enhanced renderer with BSL-like quality
     this.renderer = new THREE.WebGLRenderer({ 
-      antialias: !this.lowEndDevice && settings.shadows,
+      antialias: !this.lowEndDevice && settings.shadows && settings.fancyGraphics,
       powerPreference: 'high-performance',
       alpha: false
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.lowEndDevice ? 1.25 : 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.lowEndDevice ? 1 : (settings.fancyGraphics ? 1.5 : 1.2)));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.0;
@@ -259,6 +300,7 @@ export class GameRenderer {
     }
     
     this.setupHighlight();
+    this.setupBreakOverlay();
     this.setupWeather();
 
     // Initialize advanced systems
@@ -275,12 +317,25 @@ export class GameRenderer {
   
   // Apply settings dynamically
   private applySettings(settings: import('./settings').GameSettings) {
+    const nextRenderDistance = Math.max(3, Math.min(this.maxRenderDistance, settings.renderDistance));
+    if (nextRenderDistance !== this.renderDistance) {
+      this.renderDistance = nextRenderDistance;
+      this.fog.near = this.renderDistance * CHUNK_SIZE * 0.3;
+      this.fog.far = this.renderDistance * CHUNK_SIZE * 0.9;
+      this.chunkRefreshTimer = 999;
+      this.lastPlayerChunkX = Number.NaN;
+      this.lastPlayerChunkZ = Number.NaN;
+      this.updateChunks();
+    }
+
     // Update FOV
     this.camera.fov = settings.fov;
     this.camera.updateProjectionMatrix();
     
     // Update shadows
     this.renderer.shadowMap.enabled = !this.lowEndDevice && settings.shadows;
+    this.sunLight.castShadow = !this.lowEndDevice && settings.shadows;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.lowEndDevice ? 1 : (settings.fancyGraphics ? 1.5 : 1.2)));
     
     // Update clouds visibility
     if (settings.clouds && !this.cloudsGroup) {
@@ -293,6 +348,7 @@ export class GameRenderer {
 
   private setupLighting() {
     // BSL-like advanced lighting setup
+    const shadowsEnabled = !this.lowEndDevice && settingsManager.getSettings().shadows;
     
     // 1. Ambient Light with warm tones
     this.ambientLight = new THREE.AmbientLight(0xffe4c4, 0.4);
@@ -301,10 +357,10 @@ export class GameRenderer {
     // 2. Main Directional Light (Sun) with high quality shadows
     this.sunLight = new THREE.DirectionalLight(0xfff8e7, 2.5);
     this.sunLight.position.set(60, 120, 40);
-    this.sunLight.castShadow = true;
+    this.sunLight.castShadow = shadowsEnabled;
     
     // High quality shadow map
-    const shadowMapSize = this.lowEndDevice ? 1024 : 2048;
+    const shadowMapSize = this.lowEndDevice ? 512 : 1536;
     this.sunLight.shadow.mapSize.width = shadowMapSize;
     this.sunLight.shadow.mapSize.height = shadowMapSize;
     this.sunLight.shadow.camera.near = 0.5;
@@ -346,10 +402,35 @@ export class GameRenderer {
   }
   
   private setupSkyObjects() {
-    this.sunMesh = new THREE.Mesh(new THREE.SphereGeometry(8, 16, 16), new THREE.MeshBasicMaterial({ color: 0xffee88, fog: false }));
+    this.sunMesh = new THREE.Mesh(new THREE.SphereGeometry(9, 22, 22), new THREE.MeshBasicMaterial({ color: 0xffee88, fog: false }));
     this.scene.add(this.sunMesh);
-    this.moonMesh = new THREE.Mesh(new THREE.SphereGeometry(5, 16, 16), new THREE.MeshBasicMaterial({ color: 0xddeeff, fog: false }));
+    this.moonMesh = new THREE.Mesh(new THREE.SphereGeometry(6, 18, 18), new THREE.MeshBasicMaterial({ color: 0xddeeff, fog: false }));
     this.scene.add(this.moonMesh);
+
+    this.sunGlow = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.createSkyGlowTexture('rgba(255,236,170,1)', 'rgba(255,164,48,0)'),
+        transparent: true,
+        opacity: 0.75,
+        depthWrite: false,
+        fog: false,
+      })
+    );
+    this.sunGlow.scale.set(64, 64, 1);
+    this.scene.add(this.sunGlow);
+
+    this.moonGlow = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.createSkyGlowTexture('rgba(220,232,255,0.9)', 'rgba(145,180,255,0)'),
+        transparent: true,
+        opacity: 0.52,
+        depthWrite: false,
+        fog: false,
+      })
+    );
+    this.moonGlow.scale.set(44, 44, 1);
+    this.scene.add(this.moonGlow);
+
     this.starsGroup = new THREE.Group();
     const sp: number[] = [];
     for (let i = 0; i < 600; i++) {
@@ -361,6 +442,25 @@ export class GameRenderer {
     sg.setAttribute('position', new THREE.Float32BufferAttribute(sp, 3));
     this.starsGroup.add(new THREE.Points(sg, new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, fog: false, sizeAttenuation: false })));
     this.scene.add(this.starsGroup);
+  }
+
+  private createSkyGlowTexture(inner: string, outer: string): THREE.CanvasTexture {
+    const size = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    const grad = ctx.createRadialGradient(size / 2, size / 2, size * 0.08, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, inner);
+    grad.addColorStop(0.36, inner);
+    grad.addColorStop(1, outer);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    return tex;
   }
 
   private setupClouds() {
@@ -384,6 +484,200 @@ export class GameRenderer {
     this.highlightMesh = new THREE.LineSegments(e, new THREE.LineBasicMaterial({ color: 0x111111, linewidth: 2, transparent: true, opacity: 0.7 }));
     this.highlightMesh.visible = false;
     this.scene.add(this.highlightMesh);
+  }
+
+  private setupBreakOverlay() {
+    const geo = new THREE.BoxGeometry(1.01, 1.01, 1.01);
+    this.breakOverlayMaterial = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0.0,
+      color: 0xffffff,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+      alphaTest: 0.03,
+    });
+    this.breakOverlayMesh = new THREE.Mesh(geo, this.breakOverlayMaterial);
+    this.breakOverlayMesh.visible = false;
+    this.breakOverlayMesh.renderOrder = 8;
+    this.scene.add(this.breakOverlayMesh);
+    this.loadBreakTextures();
+  }
+
+  private loadBreakTextures() {
+    const baseUrl = (((import.meta as any)?.env?.BASE_URL) as string) || '/';
+    const cleanBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+    const loader = new THREE.TextureLoader();
+
+    for (let i = 0; i < 10; i++) {
+      const fallback = this.createProceduralCrackTexture(i);
+      this.breakStageTextures[i] = fallback;
+      const url = `${cleanBase}assets/block/destroy_stage_${i}.png`;
+      loader.load(
+        url,
+        (tex) => {
+          tex.magFilter = THREE.NearestFilter;
+          tex.minFilter = THREE.NearestFilter;
+          tex.wrapS = THREE.ClampToEdgeWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          tex.colorSpace = THREE.SRGBColorSpace;
+          const prev = this.breakStageTextures[i];
+          if (prev && prev !== tex) prev.dispose();
+          this.breakStageTextures[i] = tex;
+        },
+        undefined,
+        () => {
+          // Keep procedural fallback.
+        }
+      );
+    }
+  }
+
+  private createProceduralCrackTexture(stage: number): THREE.CanvasTexture {
+    const size = 16;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, size, size);
+
+    const crackCount = 4 + stage * 2;
+    let seed = (stage + 1) * 9127;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+
+    ctx.strokeStyle = 'rgba(0,0,0,0.95)';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < crackCount; i++) {
+      const x0 = rand() * size;
+      const y0 = rand() * size;
+      const angle = rand() * Math.PI * 2;
+      const len = 3 + rand() * (3 + stage * 0.7);
+      const x1 = x0 + Math.cos(angle) * len;
+      const y1 = y0 + Math.sin(angle) * len;
+      ctx.lineWidth = 0.8 + stage * 0.08;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+
+      // Branch crack.
+      if (stage > 2 && rand() > 0.45) {
+        const a2 = angle + (rand() > 0.5 ? 1 : -1) * (0.5 + rand() * 0.8);
+        const l2 = len * (0.3 + rand() * 0.45);
+        ctx.beginPath();
+        ctx.moveTo(x0 + (x1 - x0) * 0.6, y0 + (y1 - y0) * 0.6);
+        ctx.lineTo(x0 + (x1 - x0) * 0.6 + Math.cos(a2) * l2, y0 + (y1 - y0) * 0.6 + Math.sin(a2) * l2);
+        ctx.stroke();
+      }
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  private clearBreakState() {
+    this.activeBreak = null;
+    if (this.breakOverlayMesh) this.breakOverlayMesh.visible = false;
+  }
+
+  private isBreakingTargetSame(x: number, y: number, z: number, block: BlockType): boolean {
+    return !!this.activeBreak &&
+      this.activeBreak.x === x &&
+      this.activeBreak.y === y &&
+      this.activeBreak.z === z &&
+      this.activeBreak.block === block;
+  }
+
+  private getBreakIncrement(block: BlockType): number {
+    if (DECORATIVE_BLOCKS.has(block)) return 1.0;
+    if (block === BlockType.LEAVES || block === BlockType.LEAVES_BIRCH || block === BlockType.LEAVES_SPRUCE
+      || block === BlockType.LEAVES_JUNGLE || block === BlockType.LEAVES_ACACIA
+      || block === BlockType.LEAVES_DARK_OAK || block === BlockType.LEAVES_CHERRY
+      || block === BlockType.GLASS) return 0.65;
+
+    const props = customizationManager.getBlockProperties(block);
+    const hardness = Math.max(4, Number(props?.hardness ?? 50));
+    let toolBoost = 1;
+
+    const pickaxeBlocks = new Set([
+      BlockType.STONE, BlockType.COBBLESTONE, BlockType.OBSIDIAN, BlockType.DEEPSLATE,
+      BlockType.IRON_BLOCK, BlockType.GOLD_BLOCK, BlockType.DIAMOND_BLOCK, BlockType.LAPIS_BLOCK,
+      BlockType.REDSTONE_BLOCK, BlockType.QUARTZ_BLOCK, BlockType.QUARTZ_PILLAR, BlockType.BASALT,
+      BlockType.POLISHED_BASALT, BlockType.BEDROCK,
+    ]);
+    const axeBlocks = new Set([
+      BlockType.WOOD, BlockType.LOG_BIRCH, BlockType.LOG_SPRUCE, BlockType.LOG_JUNGLE, BlockType.LOG_ACACIA,
+      BlockType.LOG_DARK_OAK, BlockType.LOG_CHERRY, BlockType.PLANKS, BlockType.PLANKS_BIRCH, BlockType.PLANKS_SPRUCE,
+      BlockType.PLANKS_JUNGLE, BlockType.PLANKS_ACACIA, BlockType.PLANKS_DARK_OAK, BlockType.PLANKS_CHERRY,
+      BlockType.BOOKSHELF, BlockType.CRAFTING_TABLE, BlockType.FENCE_OAK, BlockType.DOOR_OAK,
+    ]);
+    const shovelBlocks = new Set([
+      BlockType.DIRT, BlockType.GRASS, BlockType.SAND, BlockType.GRAVEL, BlockType.CLAY,
+      BlockType.SNOW, BlockType.MYCELIUM, BlockType.PODZOL,
+    ]);
+
+    if (this.selectedTool === ToolType.PICKAXE && pickaxeBlocks.has(block)) toolBoost = 2.2;
+    if (this.selectedTool === ToolType.AXE && axeBlocks.has(block)) toolBoost = 2.0;
+    if (this.selectedTool === ToolType.SHOVEL && shovelBlocks.has(block)) toolBoost = 2.0;
+    if (this.selectedTool === ToolType.SWORD && DECORATIVE_BLOCKS.has(block)) toolBoost = 1.7;
+
+    const base = (10 / hardness) * toolBoost;
+    return Math.max(0.06, Math.min(0.48, base));
+  }
+
+  private updateBreakOverlay() {
+    if (!this.activeBreak || !this.breakOverlayMesh) {
+      if (this.breakOverlayMesh) this.breakOverlayMesh.visible = false;
+      return;
+    }
+    const stage = Math.max(0, Math.min(9, Math.floor(this.activeBreak.progress * 10)));
+    const tex = this.breakStageTextures[stage];
+    if (tex && this.breakOverlayMaterial.map !== tex) {
+      this.breakOverlayMaterial.map = tex;
+      this.breakOverlayMaterial.needsUpdate = true;
+    }
+    this.breakOverlayMaterial.opacity = 0.22 + this.activeBreak.progress * 0.78;
+    this.breakOverlayMesh.visible = true;
+    this.breakOverlayMesh.position.set(this.activeBreak.x + 0.5, this.activeBreak.y + 0.5, this.activeBreak.z + 0.5);
+  }
+
+  private updateBreakState(dt: number) {
+    if (!this.activeBreak) {
+      if (this.breakOverlayMesh) this.breakOverlayMesh.visible = false;
+      return;
+    }
+
+    if (!this.crosshairTarget) {
+      this.activeBreak.progress = Math.max(0, this.activeBreak.progress - dt * 3.5);
+    } else {
+      const bx = Math.floor(this.crosshairTarget.blockPos.x);
+      const by = Math.floor(this.crosshairTarget.blockPos.y);
+      const bz = Math.floor(this.crosshairTarget.blockPos.z);
+      const same = bx === this.activeBreak.x && by === this.activeBreak.y && bz === this.activeBreak.z;
+      const currentBlock = this.getBlockAtLoaded(this.activeBreak.x, this.activeBreak.y, this.activeBreak.z);
+      if (!same || currentBlock === BlockType.AIR || currentBlock !== this.activeBreak.block) {
+        this.clearBreakState();
+        return;
+      }
+      const sinceLastHit = (performance.now() - this.activeBreak.lastHit) / 1000;
+      if (sinceLastHit > 0.22) this.activeBreak.progress = Math.max(0, this.activeBreak.progress - dt * 2.2);
+    }
+
+    if (this.activeBreak.progress <= 0) {
+      this.clearBreakState();
+      return;
+    }
+    this.updateBreakOverlay();
   }
 
   private setupWeather() {
@@ -525,6 +819,55 @@ export class GameRenderer {
     const chunk = this.chunks.get(chunkKey(cx, cz));
     if (!chunk) return BlockType.AIR;
     return getBlock(chunk, ((bx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE, by, ((bz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE);
+  }
+
+  private waterKey(x: number, y: number, z: number) {
+    return `${x},${y},${z}`;
+  }
+
+  private queueWaterAt(x: number, y: number, z: number) {
+    if (y < 0 || y >= CHUNK_HEIGHT) return;
+    if (this.getBlockAtLoaded(x, y, z) !== BlockType.WATER) return;
+    this.waterFlowActive.add(this.waterKey(x, y, z));
+  }
+
+  private queueWaterAround(x: number, y: number, z: number) {
+    this.queueWaterAt(x, y, z);
+    this.queueWaterAt(x + 1, y, z);
+    this.queueWaterAt(x - 1, y, z);
+    this.queueWaterAt(x, y, z + 1);
+    this.queueWaterAt(x, y, z - 1);
+    this.queueWaterAt(x, y + 1, z);
+    this.queueWaterAt(x, y - 1, z);
+  }
+
+  private setLoadedBlockFast(x: number, y: number, z: number, blockType: BlockType, rebuildChunks: Set<string>): BlockType | null {
+    if (y < 0 || y >= CHUNK_HEIGHT) return null;
+    const cx = Math.floor(x / CHUNK_SIZE);
+    const cz = Math.floor(z / CHUNK_SIZE);
+    const key = chunkKey(cx, cz);
+    const chunk = this.chunks.get(key);
+    if (!chunk) return null;
+
+    const lx = ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const lz = ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const prev = getBlock(chunk, lx, y, lz);
+    if (prev === blockType) return prev;
+
+    setBlockInChunk(chunk, lx, y, lz, blockType);
+    rebuildChunks.add(key);
+    if (lx === 0) rebuildChunks.add(chunkKey(cx - 1, cz));
+    if (lx === CHUNK_SIZE - 1) rebuildChunks.add(chunkKey(cx + 1, cz));
+    if (lz === 0) rebuildChunks.add(chunkKey(cx, cz - 1));
+    if (lz === CHUNK_SIZE - 1) rebuildChunks.add(chunkKey(cx, cz + 1));
+    return prev;
+  }
+
+  private rebuildChunkSet(chunks: Set<string>) {
+    for (const key of chunks) {
+      const chunk = this.chunks.get(key);
+      if (chunk) this.buildChunkMesh(chunk);
+    }
   }
 
   private isBlockSolid(wx: number, wy: number, wz: number): boolean {
@@ -699,6 +1042,14 @@ export class GameRenderer {
     }
   }
 
+  private requestRedstoneRefresh(immediate = false) {
+    this.redstoneDirty = true;
+    if (!immediate) return;
+    this.lastRedstoneUpdate = 0;
+    this.redstoneDirty = false;
+    this.updateRedstone();
+  }
+
   interactBlock() {
     if (!this.crosshairTarget) return;
     const { blockPos } = this.crosshairTarget;
@@ -708,11 +1059,11 @@ export class GameRenderer {
     if (block === BlockType.LEVER) {
       if (this.redstoneActive.get(posKey)) this.redstoneActive.delete(posKey);
       else this.redstoneActive.set(posKey, true);
-      this.updateRedstone();
+      this.requestRedstoneRefresh(true);
     } else if (block === BlockType.BUTTON) {
       this.redstoneActive.set(posKey, true);
-      this.updateRedstone();
-      setTimeout(() => { this.redstoneActive.delete(posKey); this.updateRedstone(); }, 1000);
+      this.requestRedstoneRefresh(true);
+      setTimeout(() => { this.redstoneActive.delete(posKey); this.requestRedstoneRefresh(true); }, 1000);
     } else if (block === BlockType.PORTAL_FRAME || block === BlockType.OBSIDIAN) {
       if (this.tryActivatePortalFrame(bx, by, bz)) {
         return;
@@ -801,6 +1152,7 @@ export class GameRenderer {
         if (chunk) {
           setBlockInChunk(chunk, ((bx%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE, by, ((bz%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE, BlockType.AIR);
           rebuild.add(key);
+          this.queueWaterAround(bx, by, bz);
         }
       }
     }
@@ -906,6 +1258,7 @@ export class GameRenderer {
     }
     
     this.onLoadProgress(1);
+    this.requestRedstoneRefresh(false);
     console.log('[DEBUG] World generation complete!');
   }
 
@@ -968,12 +1321,13 @@ export class GameRenderer {
   
   private createNPC(name: string, pos: THREE.Vector3, color: number, dialogues: string[]): NPC {
     const g = new THREE.Group();
+    const entityShadows = !this.lowEndDevice && settingsManager.getSettings().shadows;
     
     // Body
     const bodyMat = new THREE.MeshLambertMaterial({ color: color });
     const body = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.7, 0.3), bodyMat);
     body.position.y = 0.85;
-    body.castShadow = true;
+    body.castShadow = entityShadows;
     g.add(body);
     
     // Head
@@ -1022,6 +1376,7 @@ export class GameRenderer {
 
   private createAnimal(type: string, pos: THREE.Vector3): Animal {
     const g = new THREE.Group();
+    const entityShadows = !this.lowEndDevice && settingsManager.getSettings().shadows;
     const colors: Record<string, number> = { pig: 0xf5a0a0, cow: 0x8b4513, chicken: 0xf5f5dc, sheep: 0xeeeeee, rabbit: 0xc4a060, horse: 0x8b5a2b };
     const bm = new THREE.MeshLambertMaterial({ color: colors[type] || 0xcccccc });
     const dm = new THREE.MeshLambertMaterial({ color: 0x333333 });
@@ -1032,7 +1387,7 @@ export class GameRenderer {
     let tailMesh: THREE.Mesh | undefined;
     
     if (type === 'chicken') {
-      const body = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.4,0.5), bm); body.position.y=0.4; body.castShadow=true; g.add(body);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.4,0.5), bm); body.position.y=0.4; body.castShadow=entityShadows; g.add(body);
       bodyMesh = body;
       const head = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.3,0.3), bm); head.position.set(0,0.7,0.3); g.add(head);
       headMesh = head;
@@ -1044,7 +1399,7 @@ export class GameRenderer {
       const legL = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.15,0.08), new THREE.MeshLambertMaterial({color:0xff8800})); legL.position.set(0.1,0.075,0); g.add(legL); legMeshes.push(legL);
       const legR = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.15,0.08), new THREE.MeshLambertMaterial({color:0xff8800})); legR.position.set(-0.1,0.075,0); g.add(legR); legMeshes.push(legR);
     } else if (type === 'rabbit') {
-      const body = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.25,0.4), bm); body.position.y=0.25; body.castShadow=true; g.add(body);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.25,0.4), bm); body.position.y=0.25; body.castShadow=entityShadows; g.add(body);
       bodyMesh = body;
       const head = new THREE.Mesh(new THREE.BoxGeometry(0.25,0.2,0.2), bm); head.position.set(0,0.45,0.2); g.add(head);
       headMesh = head;
@@ -1052,7 +1407,7 @@ export class GameRenderer {
       // Fluffy tail
       const tail = new THREE.Mesh(new THREE.BoxGeometry(0.1,0.1,0.1), new THREE.MeshLambertMaterial({color:0xffffff})); tail.position.set(0,0.25,-0.25); g.add(tail); tailMesh = tail;
     } else if (type === 'horse') {
-      const body = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.6,1.3), bm); body.position.y=0.8; body.castShadow=true; g.add(body);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.6,1.3), bm); body.position.y=0.8; body.castShadow=entityShadows; g.add(body);
       bodyMesh = body;
       const head = new THREE.Mesh(new THREE.BoxGeometry(0.35,0.5,0.35), bm); head.position.set(0,1.1,0.7); g.add(head);
       headMesh = head;
@@ -1065,7 +1420,7 @@ export class GameRenderer {
       const tail = new THREE.Mesh(new THREE.BoxGeometry(0.15,0.4,0.15), new THREE.MeshLambertMaterial({color:0x4a3a2a})); tail.position.set(0,0.8,-0.7); g.add(tail); tailMesh = tail;
     } else {
       const bw = type==='cow'?0.9:0.7, bh = type==='cow'?0.7:0.5, bd = type==='cow'?1.2:0.9;
-      const body = new THREE.Mesh(new THREE.BoxGeometry(bw,bh,bd), bm); body.position.y=0.6; body.castShadow=true; g.add(body);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(bw,bh,bd), bm); body.position.y=0.6; body.castShadow=entityShadows; g.add(body);
       bodyMesh = body;
       const head = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.4,0.4), bm); head.position.set(0,0.8,bd/2+0.1); g.add(head);
       headMesh = head;
@@ -1225,35 +1580,63 @@ export class GameRenderer {
           for (let i=0;i<6;i++) sns.push(0,0,1);
           pushColorQuad(solidColorOnly, sps, sns, scol.r, scol.g, scol.b);
         } else {
-          // Generic cross-plane decorative blocks
-          const s=0.4, h = block===BlockType.TALL_GRASS||block===BlockType.FERN?0.85:block===BlockType.SUGAR_CANE?0.95:0.6;
-          const crossVerts = [
-            // Diagonal 1
-            [bx-s,by-0.5,bz-s, bx+s,by-0.5,bz+s, bx+s,by-0.5+h,bz+s, bx-s,by-0.5,bz-s, bx+s,by-0.5+h,bz+s, bx-s,by-0.5+h,bz-s],
-            // Diagonal 2
-            [bx+s,by-0.5,bz-s, bx-s,by-0.5,bz+s, bx-s,by-0.5+h,bz+s, bx+s,by-0.5,bz-s, bx-s,by-0.5+h,bz+s, bx+s,by-0.5+h,bz-s],
-            // Diagonal 3
-            [bx+s,by-0.5,bz+s, bx-s,by-0.5,bz-s, bx-s,by-0.5+h,bz-s, bx+s,by-0.5,bz+s, bx-s,by-0.5+h,bz-s, bx+s,by-0.5+h,bz+s],
-            // Diagonal 4
-            [bx-s,by-0.5,bz+s, bx+s,by-0.5,bz-s, bx+s,by-0.5+h,bz-s, bx-s,by-0.5,bz+s, bx+s,by-0.5+h,bz-s, bx-s,by-0.5+h,bz+s],
-          ];
-          const crossNorms = [[0.7,0,0.7],[-0.7,0,0.7],[-0.7,0,-0.7],[0.7,0,-0.7]];
+          // Generic decorative plant rendering with natural variation (lean, height, color tint).
+          const wx = wx0 + x;
+          const wz = wz0 + z;
+          let seed = ((wx * 73856093) ^ (y * 19349663) ^ (wz * 83492791)) >>> 0;
+          const rand = () => {
+            seed = (seed * 1664525 + 1013904223) >>> 0;
+            return seed / 4294967295;
+          };
+          const isFlower =
+            block === BlockType.FLOWER_RED ||
+            block === BlockType.FLOWER_YELLOW ||
+            block === BlockType.SUNFLOWER ||
+            block === BlockType.ROSE_BUSH ||
+            block === BlockType.LILAC;
+          const isTall = block === BlockType.TALL_GRASS || block === BlockType.FERN || block === BlockType.SUGAR_CANE;
+          const baseHeight = block === BlockType.SUGAR_CANE ? 0.98 : isTall ? 0.92 : 0.66;
+          const totalHeight = baseHeight * (0.86 + rand() * 0.34);
+          const halfWidth = (isFlower ? 0.24 : 0.34) * (0.82 + rand() * 0.28);
+          const bottomY = by - 0.5;
+          const leanX = (rand() - 0.5) * 0.12;
+          const leanZ = (rand() - 0.5) * 0.12;
+          const baseRot = rand() * Math.PI;
 
-          if (decoUVs) {
-            const [u0,v0,u1,v1] = decoUVs;
-            for (let q = 0; q < 4; q++) {
-              for (let i = 0; i < 18; i++) solid.p.push(crossVerts[q][i]);
-              for (let i = 0; i < 6; i++) solid.n.push(crossNorms[q][0], crossNorms[q][1], crossNorms[q][2]);
-              solid.u.push(u0,v1, u1,v1, u1,v0, u0,v1, u1,v0, u0,v0);
-              for (let i = 0; i < 6; i++) solid.c.push(1, 1, 1);
-            }
+          const pushPlantLayer = (w: number, y0: number, y1: number, color: THREE.Color, tint: number) => {
+            const layerColor = color.clone().multiplyScalar(tint);
+            const addPlane = (angle: number) => {
+              const ax = Math.cos(angle) * w;
+              const az = Math.sin(angle) * w;
+              const x0 = bx - ax;
+              const z0 = bz - az;
+              const x1 = bx + ax;
+              const z1 = bz + az;
+              const ps: number[] = [];
+              const ns: number[] = [];
+              ps.push(x0, y0, z0, x1, y0, z1, x1 + leanX, y1, z1 + leanZ);
+              ps.push(x0, y0, z0, x1 + leanX, y1, z1 + leanZ, x0 + leanX, y1, z0 + leanZ);
+              const nx = az;
+              const nz = -ax;
+              const invLen = 1 / Math.max(0.0001, Math.hypot(nx, nz));
+              const nnx = nx * invLen;
+              const nnz = nz * invLen;
+              for (let i = 0; i < 6; i++) ns.push(nnx, 0, nnz);
+              pushColorQuad(solidColorOnly, ps, ns, layerColor.r, layerColor.g, layerColor.b);
+            };
+            addPlane(baseRot);
+            addPlane(baseRot + Math.PI * 0.5);
+          };
+
+          if (isFlower) {
+            const stemColor = new THREE.Color('#3f8f30');
+            const stemTop = bottomY + totalHeight * (block === BlockType.SUNFLOWER ? 0.78 : 0.72);
+            pushPlantLayer(halfWidth * 0.24, bottomY, stemTop, stemColor, 0.9 + rand() * 0.14);
+            const bloomColor = new THREE.Color(getBlockFaceColor(block, 'side'));
+            pushPlantLayer(halfWidth * (block === BlockType.SUNFLOWER ? 1.18 : 0.95), stemTop - totalHeight * 0.22, bottomY + totalHeight, bloomColor, 0.92 + rand() * 0.2);
           } else {
             const col = new THREE.Color(getBlockFaceColor(block, 'side'));
-            for (let q = 0; q < 4; q++) {
-              for (let i = 0; i < 18; i++) solidColorOnly.p.push(crossVerts[q][i]);
-              for (let i = 0; i < 6; i++) solidColorOnly.n.push(crossNorms[q][0], crossNorms[q][1], crossNorms[q][2]);
-              for (let i = 0; i < 6; i++) solidColorOnly.c.push(col.r, col.g, col.b);
-            }
+            pushPlantLayer(halfWidth, bottomY, bottomY + totalHeight, col, 0.84 + rand() * 0.26);
           }
         }
         continue;
@@ -1351,6 +1734,7 @@ export class GameRenderer {
     }
 
     // ── Create meshes ──
+    const chunkShadows = !this.lowEndDevice && settingsManager.getSettings().shadows && this.renderDistance <= 10;
     const atlasTex = textureManager.getAtlasTexture();
 
     // Solid atlas-textured mesh
@@ -1361,12 +1745,12 @@ export class GameRenderer {
       geo.setAttribute('uv', new THREE.Float32BufferAttribute(solid.u, 2));
       geo.setAttribute('color', new THREE.Float32BufferAttribute(solid.c, 3));
       geo.computeBoundingSphere();
-      const mat = new THREE.MeshStandardMaterial({
-        map: atlasTex, vertexColors: true, side: THREE.FrontSide,
-        roughness: 0.85, metalness: 0.05
+      const mat = new THREE.MeshLambertMaterial({
+        map: atlasTex, vertexColors: true, side: THREE.FrontSide
       });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.castShadow = true; mesh.receiveShadow = true;
+      mesh.castShadow = false;
+      mesh.receiveShadow = chunkShadows;
       this.scene.add(mesh); meshes.push(mesh);
     }
 
@@ -1377,11 +1761,12 @@ export class GameRenderer {
       geo.setAttribute('normal', new THREE.Float32BufferAttribute(solidColorOnly.n, 3));
       geo.setAttribute('color', new THREE.Float32BufferAttribute(solidColorOnly.c, 3));
       geo.computeBoundingSphere();
-      const mat = new THREE.MeshStandardMaterial({
-        vertexColors: true, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.1
+      const mat = new THREE.MeshLambertMaterial({
+        vertexColors: true, side: THREE.DoubleSide
       });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.castShadow = true; mesh.receiveShadow = true;
+      mesh.castShadow = false;
+      mesh.receiveShadow = chunkShadows;
       this.scene.add(mesh); meshes.push(mesh);
     }
 
@@ -1393,12 +1778,14 @@ export class GameRenderer {
       geo.setAttribute('uv', new THREE.Float32BufferAttribute(trans.u, 2));
       geo.setAttribute('color', new THREE.Float32BufferAttribute(trans.c, 3));
       geo.computeBoundingSphere();
-      const mat = new THREE.MeshStandardMaterial({
+      const mat = new THREE.MeshLambertMaterial({
         map: atlasTex, vertexColors: true, side: THREE.DoubleSide,
-        transparent: true, opacity: 0.75, depthWrite: false, roughness: 0.3, metalness: 0.0
+        transparent: true, opacity: 0.75, depthWrite: false
       });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.receiveShadow = true; mesh.renderOrder = 1;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.renderOrder = 1;
       this.scene.add(mesh); meshes.push(mesh);
     }
 
@@ -1409,12 +1796,14 @@ export class GameRenderer {
       geo.setAttribute('normal', new THREE.Float32BufferAttribute(transColorOnly.n, 3));
       geo.setAttribute('color', new THREE.Float32BufferAttribute(transColorOnly.c, 3));
       geo.computeBoundingSphere();
-      const mat = new THREE.MeshStandardMaterial({
+      const mat = new THREE.MeshLambertMaterial({
         vertexColors: true, side: THREE.DoubleSide,
-        transparent: true, opacity: 0.6, depthWrite: false, roughness: 0.3, metalness: 0.0
+        transparent: true, opacity: 0.6, depthWrite: false
       });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.receiveShadow = true; mesh.renderOrder = 1;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.renderOrder = 1;
       this.scene.add(mesh); meshes.push(mesh);
     }
 
@@ -1424,6 +1813,7 @@ export class GameRenderer {
   placeBlock() {
     if (!this.crosshairTarget || this.selectedTool !== ToolType.NONE) return;
     if (this.selectedBlock === BlockType.AIR) return;
+    this.clearBreakState();
     const { blockPos, normal } = this.crosshairTarget;
     const px = Math.floor(blockPos.x+normal.x), py = Math.floor(blockPos.y+normal.y), pz = Math.floor(blockPos.z+normal.z);
     const hw = PLAYER_WIDTH/2+0.1;
@@ -1439,6 +1829,36 @@ export class GameRenderer {
     if (this.onBlockChanged) this.onBlockChanged({ x: px, y: py, z: pz, type: Number(this.selectedBlock) });
   }
 
+  private finishBreakingBlock(
+    px: number,
+    py: number,
+    pz: number,
+    chunk: ChunkData,
+    lx: number,
+    lz: number,
+    existing: BlockType
+  ) {
+    // Check if this is the bottom of a tree - collapse tree.
+    const isLog = existing === BlockType.WOOD || existing === BlockType.LOG_BIRCH;
+    const blockBelow = this.getBlockAtLoaded(px, py - 1, pz);
+    const blockAbove = this.getBlockAtLoaded(px, py + 1, pz);
+    const isTreeBase = isLog && (blockBelow === BlockType.GRASS || blockBelow === BlockType.DIRT) &&
+      (blockAbove === BlockType.WOOD || blockAbove === BlockType.LOG_BIRCH);
+
+    if (existing !== BlockType.AIR) {
+      this.spawnDroppedItem(existing, new THREE.Vector3(px + 0.5, py + 0.5, pz + 0.5));
+      this.spawnBreakParticles(existing, new THREE.Vector3(px + 0.5, py + 0.5, pz + 0.5));
+    }
+
+    setBlockInChunk(chunk, lx, py, lz, BlockType.AIR);
+    this.buildChunkMesh(chunk);
+    this.rebuildEdge(lx, lz, Math.floor(px / CHUNK_SIZE), Math.floor(pz / CHUNK_SIZE));
+    this.checkRS(existing);
+    if (this.onBlockChanged) this.onBlockChanged({ x: px, y: py, z: pz, type: Number(BlockType.AIR) });
+    if (isTreeBase) this.collapseTree(px, py + 1, pz);
+    this.clearBreakState();
+  }
+
   breakBlock() {
     if (!this.crosshairTarget) return;
     const { blockPos } = this.crosshairTarget;
@@ -1448,6 +1868,10 @@ export class GameRenderer {
     if (!chunk) return;
     const lx = ((px%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE, lz = ((pz%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
     const existing = getBlock(chunk, lx, py, lz);
+    if (existing === BlockType.AIR) {
+      this.clearBreakState();
+      return;
+    }
     if (existing === BlockType.BEDROCK) return;
 
     // Tool damage to animals nearby
@@ -1459,26 +1883,25 @@ export class GameRenderer {
       this.animals = this.animals.filter(a => a.health > 0);
     }
 
-    // Check if this is the bottom of a tree - collapse tree
-    const isLog = existing === BlockType.WOOD || existing === BlockType.LOG_BIRCH;
-    const blockBelow = this.getBlockAtLoaded(px, py - 1, pz);
-    const blockAbove = this.getBlockAtLoaded(px, py + 1, pz);
-    const isTreeBase = isLog && (blockBelow === BlockType.GRASS || blockBelow === BlockType.DIRT) &&
-      (blockAbove === BlockType.WOOD || blockAbove === BlockType.LOG_BIRCH);
-
-    // Drop the block item
-    if (existing !== BlockType.AIR) {
-      this.spawnDroppedItem(existing, new THREE.Vector3(px + 0.5, py + 0.5, pz + 0.5));
-      this.spawnBreakParticles(existing, new THREE.Vector3(px + 0.5, py + 0.5, pz + 0.5));
+    if (this._gameMode === 'creative') {
+      this.finishBreakingBlock(px, py, pz, chunk, lx, lz, existing);
+      return;
     }
 
-    setBlockInChunk(chunk, lx, py, lz, BlockType.AIR);
-    this.buildChunkMesh(chunk);
-    this.rebuildEdge(lx, lz, cx, cz);
-    this.checkRS(existing);
-    if (this.onBlockChanged) this.onBlockChanged({ x: px, y: py, z: pz, type: Number(BlockType.AIR) });
+    const now = performance.now();
+    if (!this.isBreakingTargetSame(px, py, pz, existing)) {
+      this.activeBreak = { x: px, y: py, z: pz, block: existing, progress: 0, lastHit: now };
+    } else if (this.activeBreak) {
+      this.activeBreak.lastHit = now;
+    }
 
-    if (isTreeBase) this.collapseTree(px, py + 1, pz);
+    if (!this.activeBreak) return;
+    this.activeBreak.progress = Math.min(1, this.activeBreak.progress + this.getBreakIncrement(existing));
+    this.activeBreak.lastHit = now;
+    this.updateBreakOverlay();
+    if (this.activeBreak.progress < 1) return;
+
+    this.finishBreakingBlock(px, py, pz, chunk, lx, lz, existing);
   }
 
   private spawnDroppedItem(blockType: BlockType, pos: THREE.Vector3) {
@@ -1640,7 +2063,7 @@ export class GameRenderer {
     const rs = [BlockType.REDSTONE_DUST, BlockType.REDSTONE_TORCH, BlockType.REDSTONE_BLOCK,
       BlockType.REDSTONE_LAMP, BlockType.LEVER, BlockType.BUTTON, BlockType.REDSTONE_REPEATER, BlockType.COMPARATOR,
       BlockType.COMMAND_BLOCK, BlockType.TNT, BlockType.NOTE_BLOCK];
-    if (rs.includes(b)) this.updateRedstone();
+    if (rs.includes(b)) this.requestRedstoneRefresh(false);
   }
 
   private rebuildEdge(lx: number, lz: number, cx: number, cz: number) {
@@ -1665,14 +2088,14 @@ export class GameRenderer {
   }
 
   private raycast() {
-    const dir = new THREE.Vector3(0, 0, -1);
-    dir.applyEuler(new THREE.Euler(this.playerRotation.pitch, this.playerRotation.yaw, 0, 'YXZ'));
+    const dir = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(this.playerRotation.pitch, this.playerRotation.yaw, 0, 'YXZ'));
     const step = 0.05, maxDist = 8;
+    const stepVec = dir.multiplyScalar(step);
     const eye = new THREE.Vector3(this.playerPos.x, this.playerPos.y + PLAYER_EYE_HEIGHT, this.playerPos.z);
     const ray = eye.clone(), prev = ray.clone();
     for (let d = 0; d < maxDist; d += step) {
       prev.copy(ray);
-      ray.add(dir.clone().multiplyScalar(step));
+      ray.add(stepVec);
       const bx=Math.floor(ray.x), by=Math.floor(ray.y), bz=Math.floor(ray.z);
       const b = this.getBlockAtLoaded(bx, by, bz);
       if (b !== BlockType.AIR && b !== BlockType.WATER) {
@@ -1687,22 +2110,39 @@ export class GameRenderer {
 
   private updateChunks() {
     const pcx = Math.floor(this.playerPos.x/CHUNK_SIZE), pcz = Math.floor(this.playerPos.z/CHUNK_SIZE);
-    let newBuilt = false;
-    for (let dx=-this.renderDistance;dx<=this.renderDistance;dx++) for (let dz=-this.renderDistance;dz<=this.renderDistance;dz++) {
-      const cx=pcx+dx, cz=pcz+dz, key=chunkKey(cx,cz);
-      if (!this.chunks.has(key)) { this.chunks.set(key, generateChunk(cx, cz)); this.buildChunkMesh(this.chunks.get(key)!); newBuilt=true; }
+    const missing: { cx: number; cz: number; dist2: number }[] = [];
+    for (let dx = -this.renderDistance; dx <= this.renderDistance; dx++) {
+      for (let dz = -this.renderDistance; dz <= this.renderDistance; dz++) {
+        const cx = pcx + dx;
+        const cz = pcz + dz;
+        const key = chunkKey(cx, cz);
+        if (!this.chunks.has(key)) missing.push({ cx, cz, dist2: dx * dx + dz * dz });
+      }
     }
-    if (newBuilt) {
-      for (let dx=-this.renderDistance;dx<=this.renderDistance;dx++) for (let dz=-this.renderDistance;dz<=this.renderDistance;dz++) {
-        if (Math.abs(dx)>=this.renderDistance-1||Math.abs(dz)>=this.renderDistance-1) {
-          const key=chunkKey(pcx+dx,pcz+dz), c=this.chunks.get(key);
-          if (c && this.chunkMeshes.has(key)) this.buildChunkMesh(c);
+
+    if (missing.length > 0) {
+      missing.sort((a, b) => a.dist2 - b.dist2);
+      const budget = this.lowEndDevice ? 1 : (this._gameMode === 'creative' ? 3 : 2);
+      const take = Math.min(budget, missing.length);
+      for (let i = 0; i < take; i++) {
+        const { cx, cz } = missing[i];
+        const key = chunkKey(cx, cz);
+        if (this.chunks.has(key)) continue;
+        const chunk = generateChunk(cx, cz);
+        this.chunks.set(key, chunk);
+        this.buildChunkMesh(chunk);
+        const neighbors = [chunkKey(cx - 1, cz), chunkKey(cx + 1, cz), chunkKey(cx, cz - 1), chunkKey(cx, cz + 1)];
+        for (const nk of neighbors) {
+          const nc = this.chunks.get(nk);
+          if (nc && this.chunkMeshes.has(nk)) this.buildChunkMesh(nc);
         }
       }
     }
+
+    const unloadMargin = this.lowEndDevice ? 1 : 2;
     for (const [key, ms] of this.chunkMeshes) {
       const [cxs,czs] = key.split(',').map(Number);
-      if (Math.abs(cxs-pcx)>this.renderDistance+1||Math.abs(czs-pcz)>this.renderDistance+1) {
+      if (Math.abs(cxs-pcx)>this.renderDistance+unloadMargin||Math.abs(czs-pcz)>this.renderDistance+unloadMargin) {
         ms.forEach(m => { this.scene.remove(m); m.geometry.dispose(); (m.material as THREE.Material).dispose(); });
         this.chunkMeshes.delete(key); this.chunks.delete(key);
       }
@@ -1710,87 +2150,101 @@ export class GameRenderer {
   }
 
   private updateSky(dt: number) {
-    this.timeOfDay = (this.timeOfDay + dt * 0.003) % 1;
+    if (!this.externalEnvironmentControl) {
+      this.timeOfDay = (this.timeOfDay + dt * this.dayCycleSpeed) % 1;
+    }
+
     const sunAngle = this.timeOfDay * Math.PI * 2 - Math.PI / 2;
-    const sunY = Math.sin(sunAngle), sunX = Math.cos(sunAngle);
-    
+    const sunY = Math.sin(sunAngle);
+    const sunX = Math.cos(sunAngle);
+    const orbitRadius = 250;
+    const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+    const smoothstep = (v: number) => {
+      const t = clamp01(v);
+      return t * t * (3 - 2 * t);
+    };
+
     // Position sun and moon
-    this.sunMesh.position.set(this.playerPos.x+sunX*250, sunY*250, this.playerPos.z);
-    this.moonMesh.position.set(this.playerPos.x-sunX*250, -sunY*250, this.playerPos.z);
+    this.sunMesh.position.set(this.playerPos.x + sunX * orbitRadius, sunY * orbitRadius, this.playerPos.z);
+    this.moonMesh.position.set(this.playerPos.x - sunX * orbitRadius, -sunY * orbitRadius, this.playerPos.z);
+    this.sunGlow.position.copy(this.sunMesh.position);
+    this.moonGlow.position.copy(this.moonMesh.position);
     this.starsGroup.position.copy(this.playerPos);
-    
-    // Calculate day/night cycle
-    const day = Math.max(0, sunY);
-    const dawn = Math.max(0, Math.min(1, (sunY + 0.2) * 3)) * (sunY < 0.3 ? 1 : 0);
-    const dusk = Math.max(0, Math.min(1, (0.2 - sunY) * 3)) * (sunY < 0.2 && sunY > -0.3 ? 1 : 0);
-    
-    // BSL-like sky colors
-    const nightColor = new THREE.Color(0x0a0a1a);
-    const dayColor = new THREE.Color(0x6ec0f0);
-    const dawnColor = new THREE.Color(0xff9966);
-    const duskColor = new THREE.Color(0xff6644);
-    
-    this.skyColor.copy(nightColor);
-    if (day > 0) this.skyColor.lerp(dayColor, day);
-    if (dawn > 0) this.skyColor.lerp(dawnColor, dawn * 0.7);
-    if (dusk > 0) this.skyColor.lerp(duskColor, dusk * 0.7);
-    
+
+    // Smoother daylight/twilight curves.
+    const daylight = smoothstep((sunY + 0.2) / 0.82);
+    const twilight = smoothstep(1 - Math.abs(sunY) / 0.34);
+    const dawn = twilight * (sunX > 0 ? 1 : 0);
+    const dusk = twilight * (sunX <= 0 ? 1 : 0);
+
+    // Sky colors
+    const nightColor = new THREE.Color(0x05091b);
+    const dayColor = new THREE.Color(0x75ccff);
+    const dawnColor = new THREE.Color(0xffa063);
+    const duskColor = new THREE.Color(0xff744d);
+
+    this.skyColor.copy(nightColor).lerp(dayColor, daylight);
+    if (dawn > 0) this.skyColor.lerp(dawnColor, dawn * 0.58);
+    if (dusk > 0) this.skyColor.lerp(duskColor, dusk * 0.62);
     this.scene.background = this.skyColor;
-    
-    // Update fog color to match sky
-    const fogColor = this.skyColor.clone();
-    fogColor.lerp(new THREE.Color(0xffffff), 0.1);  // Slightly lighter
+
+    // Fog color follows sky with weather tint.
+    const fogColor = this.skyColor.clone().lerp(new THREE.Color(0xffffff), 0.08);
+    if (this.weather === 'rain') fogColor.lerp(new THREE.Color(0x8092a8), 0.26);
+    if (this.weather === 'snow') fogColor.lerp(new THREE.Color(0xe5f2ff), 0.2);
+    if (this.weather === 'storm') fogColor.lerp(new THREE.Color(0x4f5d76), 0.44);
     this.fog.color = fogColor;
-    
-    // Update sun light with BSL-like quality
-    this.sunLight.position.set(this.playerPos.x+sunX*100, Math.max(sunY*100, 10), this.playerPos.z+50);
+
+    // Weather-dimmed sunlight at same time curve.
+    const weatherLightMul = this.weather === 'storm' ? 0.52 : this.weather === 'rain' ? 0.72 : this.weather === 'snow' ? 0.86 : 1;
+    this.sunLight.position.set(this.playerPos.x + sunX * 100, Math.max(sunY * 100, 10), this.playerPos.z + 50);
     this.sunLight.target.position.copy(this.playerPos);
-    
-    // Dynamic sun intensity and color
-    const sunIntensity = Math.max(0.2, day * 2.5);
-    this.sunLight.intensity = sunIntensity;
-    
-    // Sun color based on time
-    const sunColor = new THREE.Color(0xfff8e7);
-    if (dawn > 0) sunColor.lerp(new THREE.Color(0xffaa66), dawn * 0.8);
-    if (dusk > 0) sunColor.lerp(new THREE.Color(0xff8866), dusk * 0.8);
-    if (day < 0.1) sunColor.lerp(new THREE.Color(0x6666aa), 1 - day * 10);
+    this.sunLight.intensity = (0.2 + daylight * 2.35) * weatherLightMul;
+
+    const sunColor = new THREE.Color(0xfff8e8);
+    if (dawn > 0) sunColor.lerp(new THREE.Color(0xffb36d), dawn * 0.85);
+    if (dusk > 0) sunColor.lerp(new THREE.Color(0xff8f66), dusk * 0.85);
+    if (daylight < 0.1) sunColor.lerp(new THREE.Color(0x6c78b8), 1 - daylight * 10);
     this.sunLight.color = sunColor;
-    
-    this.sunLight.shadow.camera.updateProjectionMatrix();
-    
-    // Hemisphere light for ambient sky/ground
+
     this.hemiLight.groundColor.lerp(new THREE.Color(0x4a6b4a), 0.01);
-    this.hemiLight.intensity = 0.1 + day * 0.5;
-    
-    // Ambient light
-    this.ambientLight.intensity = 0.15 + day * 0.35;
-    
-    // Stars visibility
+    this.hemiLight.intensity = (0.09 + daylight * 0.56) * weatherLightMul;
+    this.ambientLight.intensity = 0.12 + daylight * 0.4 * weatherLightMul;
+
+    // Stars, sun, moon visuals
+    const starsOpacity = clamp01(1 - daylight * 1.35);
     const sp = this.starsGroup.children[0] as THREE.Points;
-    (sp.material as THREE.PointsMaterial).opacity = Math.max(0, 1 - day * 2.5);
-    
-    // Sun appearance
-    const sunMeshColor = new THREE.Color(0xffee88);
-    if (dawn > 0.5 || dusk > 0.5) sunMeshColor.lerp(new THREE.Color(0xff6644), 0.7);
+    (sp.material as THREE.PointsMaterial).opacity = starsOpacity;
+
+    const sunMeshColor = new THREE.Color(0xffef9e);
+    if (dawn > 0.4 || dusk > 0.4) sunMeshColor.lerp(new THREE.Color(0xff7f58), 0.65);
     (this.sunMesh.material as THREE.MeshBasicMaterial).color = sunMeshColor;
-    
+    (this.sunGlow.material as THREE.SpriteMaterial).opacity = clamp01(0.15 + daylight * 0.75);
+    (this.sunGlow.material as THREE.SpriteMaterial).color.set(sunMeshColor);
+
+    const moonColor = new THREE.Color(0xcfdfff).lerp(new THREE.Color(0xf7fbff), starsOpacity * 0.7);
+    (this.moonMesh.material as THREE.MeshBasicMaterial).color = moonColor;
+    (this.moonGlow.material as THREE.SpriteMaterial).opacity = clamp01(0.14 + starsOpacity * 0.62);
+    (this.moonGlow.material as THREE.SpriteMaterial).color.set(moonColor);
+
     // Cloud movement
-    this.cloudsGroup.children.forEach((c, i) => { 
-      c.position.x += dt * 0.5 * (0.5 + (i % 3) * 0.3); 
-      if (c.position.x > this.playerPos.x + 300) c.position.x = this.playerPos.x - 300; 
-    });
-    
+    if (this.cloudsGroup) {
+      this.cloudsGroup.children.forEach((c, i) => {
+        c.position.x += dt * 0.5 * (0.5 + (i % 3) * 0.3);
+        if (c.position.x > this.playerPos.x + 300) c.position.x = this.playerPos.x - 300;
+      });
+    }
+
     // Tone mapping exposure
-    this.renderer.toneMappingExposure = 0.5 + day * 0.8;
-    
+    this.renderer.toneMappingExposure = 0.45 + daylight * 0.9;
+
     // Update fog density based on weather and time
     let fogDensity = 0.008;
     if (this.weather === 'rain') fogDensity = 0.015;
     else if (this.weather === 'snow') fogDensity = 0.012;
     else if (this.weather === 'storm') fogDensity = 0.02;
-    if (day < 0.3) fogDensity *= 1.5;  // Thicker fog at night
-    
+    if (daylight < 0.3) fogDensity *= 1.45;  // Thicker fog at night
+
     if (this.fog instanceof THREE.FogExp2) {
       this.fog.density = fogDensity;
     }
@@ -1979,21 +2433,20 @@ export class GameRenderer {
   private update(dt: number) {
     const creative = this._gameMode === 'creative';
     const speed = creative ? FLY_SPEED : PLAYER_SPEED;
-    const fwd = new THREE.Vector3(0,0,-1).applyEuler(new THREE.Euler(0, this.playerRotation.yaw, 0, 'YXZ'));
-    const right = new THREE.Vector3(1,0,0).applyEuler(new THREE.Euler(0, this.playerRotation.yaw, 0, 'YXZ'));
+    const fwd = this.forwardVec.set(0, 0, -1).applyEuler(new THREE.Euler(0, this.playerRotation.yaw, 0, 'YXZ'));
+    const right = this.rightVec.set(1, 0, 0).applyEuler(new THREE.Euler(0, this.playerRotation.yaw, 0, 'YXZ'));
+    const mv = this.moveVec.set(0, 0, 0);
 
     if (creative) {
-      const mv = new THREE.Vector3();
-      mv.add(fwd.clone().multiplyScalar(-this.moveInput.z));
-      mv.add(right.clone().multiplyScalar(this.moveInput.x));
+      mv.addScaledVector(fwd, -this.moveInput.z);
+      mv.addScaledVector(right, this.moveInput.x);
       if (this.flyUp) mv.y+=1; if (this.flyDown) mv.y-=1;
       if (mv.length()>0) mv.normalize().multiplyScalar(speed*dt);
       this.playerPos.add(mv);
       this.playerPos.y = Math.max(1, Math.min(CHUNK_HEIGHT+30, this.playerPos.y));
     } else {
-      const mv = new THREE.Vector3();
-      mv.add(fwd.clone().multiplyScalar(-this.moveInput.z));
-      mv.add(right.clone().multiplyScalar(this.moveInput.x));
+      mv.addScaledVector(fwd, -this.moveInput.z);
+      mv.addScaledVector(right, this.moveInput.x);
       if (mv.length()>0) mv.normalize().multiplyScalar(speed);
       this.playerVelocity.x = mv.x; this.playerVelocity.z = mv.z;
       this.playerVelocity.y -= GRAVITY*dt;
@@ -2017,23 +2470,58 @@ export class GameRenderer {
     this.camera.rotation.y = this.playerRotation.yaw;
     this.camera.rotation.x = this.playerRotation.pitch;
 
-    this.crosshairTarget = this.raycast();
+    this.raycastAccumulator += dt;
+    if (this.crosshairTarget === null || this.raycastAccumulator >= this.raycastStep) {
+      this.raycastAccumulator = 0;
+      this.crosshairTarget = this.raycast();
+    }
     if (this.crosshairTarget) {
       this.highlightMesh.visible = true;
       this.highlightMesh.position.set(this.crosshairTarget.blockPos.x+0.5, this.crosshairTarget.blockPos.y+0.5, this.crosshairTarget.blockPos.z+0.5);
     } else { this.highlightMesh.visible = false; }
+    this.updateBreakState(dt);
 
-    this.updateSky(dt);
-    this.updateAnimals(dt);
+    this.skyUpdateAccumulator += dt;
+    if (this.skyUpdateAccumulator >= this.skyStep) {
+      this.updateSky(this.skyUpdateAccumulator);
+      this.skyUpdateAccumulator = 0;
+    }
+    this.animalsUpdateAccumulator += dt;
+    if (this.animalsUpdateAccumulator >= this.animalsStep) {
+      this.updateAnimals(this.animalsUpdateAccumulator);
+      this.animalsUpdateAccumulator = 0;
+    }
     this.updateDroppedItems(dt);
     this.updateBreakParticles(dt);
-    this.updateWeather(dt);
+    this.weatherUpdateAccumulator += dt;
+    if (this.weatherUpdateAccumulator >= this.weatherStep) {
+      this.updateWeather(this.weatherUpdateAccumulator);
+      this.weatherUpdateAccumulator = 0;
+    }
+    this.waterFlowAccumulator += dt;
+    if (this.waterFlowAccumulator >= this.waterFlowStep) {
+      this.updateWaterFlow();
+      this.waterFlowAccumulator = 0;
+    }
     this.updateSeasons(dt);
-    this.updateChunks();
+    const playerChunkX = Math.floor(this.playerPos.x / CHUNK_SIZE);
+    const playerChunkZ = Math.floor(this.playerPos.z / CHUNK_SIZE);
+    this.chunkRefreshTimer += dt;
+    if (
+      playerChunkX !== this.lastPlayerChunkX ||
+      playerChunkZ !== this.lastPlayerChunkZ ||
+      this.chunkRefreshTimer >= (this.lowEndDevice ? 0.55 : 0.33)
+    ) {
+      this.lastPlayerChunkX = playerChunkX;
+      this.lastPlayerChunkZ = playerChunkZ;
+      this.chunkRefreshTimer = 0;
+      this.updateChunks();
+    }
     this.lastRedstoneUpdate += dt;
     this.portalCooldown = Math.max(0, this.portalCooldown - dt);
-    if (this.lastRedstoneUpdate >= 0.15) {
+    if (this.redstoneDirty && this.lastRedstoneUpdate >= 0.05) {
       this.lastRedstoneUpdate = 0;
+      this.redstoneDirty = false;
       this.updateRedstone();
     }
     if (this.portalCooldown <= 0 && this.onPortalTravel) {
@@ -2060,50 +2548,20 @@ export class GameRenderer {
   }
   
   private updateWeather(dt: number) {
-    // Random weather changes
-    this.weatherTimer += dt;
-    if (this.weatherTimer > 60) { // Check every minute
-      this.weatherTimer = 0;
-      const rand = Math.random();
-      if (rand < 0.6) {
-        this.weather = 'clear';
-      } else if (rand < 0.8) {
-        this.weather = 'rain';
-      } else if (rand < 0.95) {
-        this.weather = 'snow';
-      } else {
-        this.weather = 'storm';
-      }
-      
-      // Update visibility
-      this.rainParticles.visible = this.weather === 'rain' || this.weather === 'storm';
-      this.snowParticles.visible = this.weather === 'snow';
-      
-      // Adjust lighting based on weather
-      if (this.weather === 'rain') {
-        this.sunLight.intensity = 0.8;
-        this.ambientLight.intensity = 0.25;
-        if (this.fog instanceof THREE.FogExp2) {
-          this.fog.color.setHex(0x8899aa);
-        }
-      } else if (this.weather === 'snow') {
-        this.sunLight.intensity = 1.0;
-        this.ambientLight.intensity = 0.3;
-        if (this.fog instanceof THREE.FogExp2) {
-          this.fog.color.setHex(0xcceeff);
-        }
-      } else if (this.weather === 'storm') {
-        this.sunLight.intensity = 0.4;
-        this.ambientLight.intensity = 0.15;
-        if (this.fog instanceof THREE.FogExp2) {
-          this.fog.color.setHex(0x556677);
-        }
-      } else {
-        // Clear
-        this.sunLight.intensity = 2.5;
-        this.ambientLight.intensity = 0.4;
-        if (this.fog instanceof THREE.FogExp2) {
-          this.fog.color.setHex(0x87ceeb);
+    // Random weather changes (disabled for multiplayer clients controlled by host).
+    if (!this.externalEnvironmentControl) {
+      this.weatherTimer += dt;
+      if (this.weatherTimer > 60) { // Check every minute
+        this.weatherTimer = 0;
+        const rand = Math.random();
+        if (rand < 0.6) {
+          this.setWeather('clear');
+        } else if (rand < 0.8) {
+          this.setWeather('rain');
+        } else if (rand < 0.95) {
+          this.setWeather('snow');
+        } else {
+          this.setWeather('storm');
         }
       }
     }
@@ -2151,6 +2609,61 @@ export class GameRenderer {
         }, 100);
       }
     }
+  }
+
+  private updateWaterFlow() {
+    if (this.waterFlowActive.size === 0) return;
+
+    const pending = Array.from(this.waterFlowActive);
+    this.waterFlowActive.clear();
+
+    const maxUpdates = this.lowEndDevice ? 64 : 140;
+    const rebuildChunks = new Set<string>();
+    let processed = 0;
+
+    for (let i = 0; i < pending.length && processed < maxUpdates; i++) {
+      const parts = pending[i].split(',');
+      if (parts.length !== 3) continue;
+      const x = Number(parts[0]);
+      const y = Number(parts[1]);
+      const z = Number(parts[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      if (this.getBlockAtLoaded(x, y, z) !== BlockType.WATER) continue;
+
+      processed++;
+      let changed = false;
+
+      // Gravity first: always try to flow down.
+      if (y > 0 && this.getBlockAtLoaded(x, y - 1, z) === BlockType.AIR) {
+        const prev = this.setLoadedBlockFast(x, y - 1, z, BlockType.WATER, rebuildChunks);
+        if (prev === BlockType.AIR) {
+          changed = true;
+          this.waterFlowActive.add(this.waterKey(x, y - 1, z));
+        }
+      } else {
+        // Side flow on supported ground to avoid instant flooding in mid-air.
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let spreads = 0;
+        for (const d of dirs) {
+          if (spreads >= 2) break;
+          const nx = x + d[0];
+          const nz = z + d[1];
+          if (this.getBlockAtLoaded(nx, y, nz) !== BlockType.AIR) continue;
+          const below = y > 0 ? this.getBlockAtLoaded(nx, y - 1, nz) : BlockType.BEDROCK;
+          if (below === BlockType.AIR) continue;
+          const prev = this.setLoadedBlockFast(nx, y, nz, BlockType.WATER, rebuildChunks);
+          if (prev === BlockType.AIR) {
+            spreads++;
+            changed = true;
+            this.waterFlowActive.add(this.waterKey(nx, y, nz));
+          }
+        }
+      }
+
+      if (changed) this.waterFlowActive.add(this.waterKey(x, y, z));
+    }
+
+    if (rebuildChunks.size > 0) this.rebuildChunkSet(rebuildChunks);
   }
   
   private updateSeasons(dt: number) {
@@ -2243,6 +2756,15 @@ export class GameRenderer {
       (p.mesh.material as THREE.Material).dispose();
     }
     this.breakParticles = [];
+    if (this.breakOverlayMesh) {
+      this.scene.remove(this.breakOverlayMesh);
+      this.breakOverlayMesh.geometry.dispose();
+      this.breakOverlayMaterial.dispose();
+      this.breakOverlayMesh.visible = false;
+    }
+    for (const tex of this.breakStageTextures) tex.dispose();
+    this.breakStageTextures = [];
+    this.activeBreak = null;
     const g = window as any;
     if (g.Creativ44?.__renderer === this) delete g.Creativ44;
     if (this.container.contains(this.renderer.domElement)) this.container.removeChild(this.renderer.domElement);
@@ -2295,7 +2817,13 @@ export class GameRenderer {
       if (!chunk || ev.y < 0 || ev.y >= CHUNK_HEIGHT) continue;
       const lx = ((ev.x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
       const lz = ((ev.z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-      setBlockInChunk(chunk, lx, ev.y, lz, Number(ev.type) as BlockType);
+      const prev = getBlock(chunk, lx, ev.y, lz);
+      const nextType = Number(ev.type) as BlockType;
+      setBlockInChunk(chunk, lx, ev.y, lz, nextType);
+      this.checkRS(prev);
+      this.checkRS(nextType);
+      this.queueWaterAround(ev.x, ev.y, ev.z);
+      if (nextType === BlockType.WATER) this.queueWaterAt(ev.x, ev.y, ev.z);
       rebuild.add(key);
       if (lx === 0) rebuild.add(chunkKey(cx - 1, cz));
       if (lx === CHUNK_SIZE - 1) rebuild.add(chunkKey(cx + 1, cz));
@@ -2426,41 +2954,62 @@ export class GameRenderer {
   }
 
   setBlockAt(x: number, y: number, z: number, blockType: BlockType) {
-    const cx = Math.floor(x / CHUNK_SIZE);
-    const cz = Math.floor(z / CHUNK_SIZE);
-    const key = chunkKey(cx, cz);
-    const chunk = this.chunks.get(key);
-    if (chunk) {
-      const lx = ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-      const lz = ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-      setBlockInChunk(chunk, lx, y, lz, blockType);
-      this.buildChunkMesh(chunk);
+    const rebuildChunks = new Set<string>();
+    const prev = this.setLoadedBlockFast(x, y, z, blockType, rebuildChunks);
+    if (prev === null || prev === blockType) return;
 
-      // Check if block should fall
-      if (this.physicsEngine.shouldBlockFall(blockType)) {
-        this.physicsEngine.makeFallingBlock(x, y, z, blockType);
-      }
-      if (this.onBlockChanged) this.onBlockChanged({ x, y, z, type: Number(blockType) });
+    this.rebuildChunkSet(rebuildChunks);
+    this.checkRS(prev);
+    this.checkRS(blockType);
+
+    // Check if block should fall
+    if (this.physicsEngine.shouldBlockFall(blockType)) {
+      this.physicsEngine.makeFallingBlock(x, y, z, blockType);
     }
+    this.queueWaterAround(x, y, z);
+    if (blockType === BlockType.WATER) this.queueWaterAt(x, y, z);
+    if (this.onBlockChanged) this.onBlockChanged({ x, y, z, type: Number(blockType) });
   }
 
 
   setWorldTime(timeValue: number) {
-    this.timeOfDay = (timeValue % 24000) / 24000;
+    const wrapped = ((timeValue % 24000) + 24000) % 24000;
+    this.timeOfDay = wrapped / 24000;
     console.log(`[Renderer] Set world time to ${timeValue}`);
   }
 
   setWeather(weather: string) {
-    this.weather = weather as 'clear' | 'rain' | 'snow' | 'storm';
-    this.rainParticles.visible = weather === 'rain' || weather === 'storm';
-    this.snowParticles.visible = weather === 'snow';
-    console.log(`[Renderer] Set weather to ${weather}`);
+    const normalized = weather === 'rain' || weather === 'snow' || weather === 'storm' ? weather : 'clear';
+    if (this.weather === normalized) return;
+    this.weather = normalized;
+    this.rainParticles.visible = normalized === 'rain' || normalized === 'storm';
+    this.snowParticles.visible = normalized === 'snow';
+    console.log(`[Renderer] Set weather to ${normalized}`);
+  }
+
+  setExternalEnvironmentControl(enabled: boolean) {
+    this.externalEnvironmentControl = enabled;
+    if (!enabled) this.weatherTimer = 0;
+  }
+
+  getTimeOfDayNormalized() {
+    return ((this.timeOfDay % 1) + 1) % 1;
+  }
+
+  setTimeOfDayNormalized(value: number) {
+    if (!Number.isFinite(value)) return;
+    this.timeOfDay = ((value % 1) + 1) % 1;
+  }
+
+  getWeatherType(): 'clear' | 'rain' | 'snow' | 'storm' {
+    return this.weather;
   }
 
   setGameMode(mode: string) {
-    this._gameMode = mode as GameMode;
+    const normalized = mode === 'grounded' ? 'survival' : mode;
+    this._gameMode = normalized as GameMode;
     this.onModeChange(this._gameMode);
-    console.log(`[Renderer] Set game mode to ${mode}`);
+    console.log(`[Renderer] Set game mode to ${normalized}`);
   }
 
   spawnEntity(entityType: string, x: number, y: number, z: number) {
@@ -2548,7 +3097,7 @@ export class GameRenderer {
       explode: (x: number, y: number, z: number, power = 4) => this.createExplosion(x, y, z, power),
       setTime: (value: number) => this.setWorldTime(value),
       setWeather: (weather: 'clear' | 'rain' | 'snow' | 'storm') => this.setWeather(weather),
-      setGameMode: (mode: 'creative' | 'survival') => this.setGameMode(mode),
+      setGameMode: (mode: 'creative' | 'survival' | 'grounded') => this.setGameMode(mode),
       summon: (entity: string, x: number, y: number, z: number) => this.spawnEntity(entity, x, y, z),
       execute: (command: string) => this.executeCommand(command),
       registerCommand: (name: string, handler: (args: string[], ctx: CommandContext) => Promise<{ success: boolean; output: string }>) => {

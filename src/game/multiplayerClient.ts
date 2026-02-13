@@ -12,12 +12,18 @@ export interface MultiplayerSession {
   world: MultiplayerWorldInfo;
 }
 
+export interface MultiplayerEnvironmentState {
+  timeOfDay: number;
+  weather: 'clear' | 'rain' | 'snow' | 'storm';
+}
+
 interface PullResponse {
   players: MultiplayerPlayerState[];
   events: Array<MultiplayerBlockEvent & { seq: number; authorId: string }>;
   animals: MultiplayerAnimalState[];
   latestSeq: number;
   world: MultiplayerWorldInfo;
+  environment?: MultiplayerEnvironmentState;
 }
 
 class MultiplayerClient {
@@ -66,6 +72,7 @@ class MultiplayerClient {
     player: MultiplayerPlayerState;
     events?: MultiplayerBlockEvent[];
     animals?: MultiplayerAnimalState[];
+    environment?: MultiplayerEnvironmentState;
   }): Promise<void> {
     const key = this.roomKey(payload.roomCode, payload.playerId);
     const pinned = this.roomEndpoint.get(key);
@@ -91,6 +98,7 @@ class MultiplayerClient {
           animals: Array.isArray(j.animals) ? j.animals : [],
           latestSeq: Number(j.latestSeq || sinceSeq),
           world: j.world,
+          environment: j.environment,
         };
       } catch (e) {
         errors.push(`${endpoint}: ${String((e as Error)?.message || e)}`);
