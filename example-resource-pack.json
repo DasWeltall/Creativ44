@@ -1,0 +1,27 @@
+{
+  "name": "My Awesome Texture Pack",
+  "author": "Your Name",
+  "version": "1.0.0",
+  "description": "A custom texture pack for MiniCraft with high-resolution textures",
+  "customTextures": {
+    "GRASS": "https://example.com/textures/grass.png",
+    "DIRT": "https://example.com/textures/dirt.png",
+    "STONE": "https://example.com/textures/stone.png",
+    "WOOD": "https://example.com/textures/wood.png",
+    "LEAVES": "https://example.com/textures/leaves.png",
+    "SAND": "https://example.com/textures/sand.png",
+    "COBBLESTONE": "https://example.com/textures/cobblestone.png",
+    "PLANKS": "https://example.com/textures/planks.png",
+    "GLASS": "https://example.com/textures/glass.png",
+    "BRICK": "https://example.com/textures/brick.png",
+    "DIAMOND_BLOCK": "https://example.com/textures/diamond_block.png",
+    "GOLD_BLOCK": "https://example.com/textures/gold_block.png",
+    "IRON_BLOCK": "https://example.com/textures/iron_block.png",
+    "OBSIDIAN": "https://example.com/textures/obsidian.png",
+    "BEDROCK": "https://example.com/textures/bedrock.png",
+    "TNT": "https://example.com/textures/tnt.png",
+    "CRAFTING_TABLE": "https://example.com/textures/crafting_table.png",
+    "FURNACE": "https://example.com/textures/furnace.png"
+  },
+  "enabled": true
+}
